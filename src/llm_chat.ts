@@ -1072,6 +1072,8 @@ export class LLMChatPipeline {
       this.tvm.endScope();
     }
 
+    const outputTokenBegin = performance.now();
+
     // 1. Move logits to CPU
     this.tvm.beginScope();
     this.updateLogitsOnCPU(logitsOnGPU);
@@ -1091,6 +1093,9 @@ export class LLMChatPipeline {
       if (this.logitProcessor !== undefined) {
         logitsOnCPUArray = this.logitProcessor.processLogits(logitsOnCPUArray);
       }
+
+      const logitBiasBegin = performance.now();
+
       if (_hasValue(logit_bias)) {
         for (const tokenID in logit_bias) {
           const curBias = logit_bias[tokenID];
@@ -1107,7 +1112,15 @@ export class LLMChatPipeline {
         }
       }
       this.logitsOnCPU.copyFrom(logitsOnCPUArray);
+
+      const logitBiasEnd = performance.now();
+      const timeSpent = (logitBiasEnd - logitBiasBegin) / 1e3;
+      console.log(
+        `Time spent on applying logit bias: ${timeSpent.toFixed(4)} seconds`,
+      );
     }
+
+    const penaltyBegin = performance.now();
 
     // 3. Apply penalties to logits
     if (_hasValue(frequency_penalty) && _hasValue(presence_penalty)) {
@@ -1154,8 +1167,16 @@ export class LLMChatPipeline {
       this.tvm.endScope();
     }
 
+    const penaltyEnd = performance.now();
+    const penaltyTime = (penaltyEnd - penaltyBegin) / 1e3;
+    console.log(
+      `Time spent on applying penalties: ${penaltyTime.toFixed(4)} seconds`,
+    );
+
     // 4. Sample token from logits
     // If logprobs, need the actual distribution via softmax, otherwise directly sample from logits
+    const softmaxBegin = performance.now();
+
     let sampledToken: number;
     if (logprobs) {
       // Inplace transform logitsOnCPU to a distribution
@@ -1173,6 +1194,12 @@ export class LLMChatPipeline {
         top_p,
       );
     }
+
+    const softmaxEnd = performance.now();
+    const softmaxTime = (softmaxEnd - softmaxBegin) / 1e3;
+    console.log(
+      `Time spent on softmax and sampling: ${softmaxTime.toFixed(4)} seconds`,
+    );
 
     // 5. Update logit processor
     this.logitProcessor?.processSampledToken(sampledToken);
@@ -1193,6 +1220,12 @@ export class LLMChatPipeline {
         throw Error("Grammar matcher rejected the newly sampled token.");
       }
     }
+
+    const outputTokenEnd = performance.now();
+    const outputTokenTime = (outputTokenEnd - outputTokenBegin) / 1e3;
+    console.log(
+      `Time spent on output token generation: ${outputTokenTime.toFixed(4)} seconds`,
+    );
 
     return sampledToken;
   }

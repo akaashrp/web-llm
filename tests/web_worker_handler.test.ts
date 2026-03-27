@@ -13,6 +13,7 @@ const forwardMock = jest.fn<(...args: any[]) => Promise<any>>();
 const chatCompletionMock = jest.fn<(...args: any[]) => Promise<any>>();
 const completionMock = jest.fn<(...args: any[]) => Promise<any>>();
 const embeddingMock = jest.fn<(...args: any[]) => Promise<any>>();
+const drainTraceEventsMock = jest.fn<(...args: any[]) => Promise<any[]>>();
 const setLogitRegistryMock = jest.fn<(...args: any[]) => void>();
 const setAppConfigMock = jest.fn<(...args: any[]) => void>();
 
@@ -22,6 +23,7 @@ const mockEngineInstance: Record<string, any> = {
   chatCompletion: chatCompletionMock,
   completion: completionMock,
   embedding: embeddingMock,
+  drainTraceEvents: drainTraceEventsMock,
   setInitProgressCallback: jest.fn((cb) => {
     mockEngineInstance.__initCb = cb;
   }),
@@ -41,6 +43,7 @@ beforeEach(() => {
   chatCompletionMock.mockClear();
   completionMock.mockClear();
   embeddingMock.mockClear();
+  drainTraceEventsMock.mockClear();
   setLogitRegistryMock.mockClear();
   setAppConfigMock.mockClear();
   mockEngineInstance.__initCb = undefined;
@@ -136,6 +139,32 @@ test("completionNonStreaming routes to engine completion", async () => {
   expect(onComplete).toHaveBeenCalledWith({ object: "text_completion" });
 });
 
+test("drainTraceEvents message routes to engine drain", async () => {
+  const handler = new WebWorkerMLCEngineHandler();
+  drainTraceEventsMock.mockResolvedValueOnce([
+    {
+      abs_ts_ms: 1,
+      ctx: "decode_worker",
+      phase: "decode.step",
+      seq: 1,
+    },
+  ]);
+  const onComplete = jest.fn();
+  handler.onmessage(
+    {
+      kind: "drainTraceEvents",
+      uuid: "trace-drain",
+      content: { options: { clear: true } },
+    } as any,
+    onComplete,
+  );
+  await flushMicrotasks();
+  expect(drainTraceEventsMock).toHaveBeenCalledWith({ clear: true });
+  expect(onComplete).toHaveBeenCalledWith(
+    expect.arrayContaining([expect.objectContaining({ phase: "decode.step" })]),
+  );
+});
+
 test("embedding message reloads if needed and returns embeddings", async () => {
   const handler = new WebWorkerMLCEngineHandler();
   embeddingMock.mockResolvedValueOnce({ object: "list", data: [] });
@@ -197,6 +226,7 @@ class MockWorker {
     }));
     this.setResponder("embedding", () => ({ object: "list", data: [] }));
     this.setResponder("reload", () => null);
+    this.setResponder("drainTraceEvents", () => []);
   }
 
   setResponder(kind: string, responder: (msg: any) => any) {
@@ -313,4 +343,21 @@ test("WebWorkerMLCEngine info helpers resolve via worker messages", async () => 
   expect(worker.sent.some((msg) => msg.kind === "interruptGenerate")).toBe(
     true,
   );
+});
+
+test("WebWorkerMLCEngine drainTraceEvents merges worker response", async () => {
+  const worker = new MockWorker();
+  worker.setResponder("drainTraceEvents", () => [
+    {
+      abs_ts_ms: 5,
+      ctx: "decode_worker",
+      phase: "worker.event",
+      seq: 1,
+    },
+  ]);
+  const engine = new WebWorkerMLCEngine(worker as any);
+  await engine.reload("demo");
+  const events = await engine.drainTraceEvents({ clear: true });
+  expect(events.some((event) => event.phase === "worker.event")).toBe(true);
+  expect(worker.sent.some((msg) => msg.kind === "drainTraceEvents")).toBe(true);
 });

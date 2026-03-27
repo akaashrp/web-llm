@@ -14,6 +14,7 @@ import {
   NonWorkerEnvironmentError,
   ServiceWorkerInitializationError,
 } from "./error";
+import { getTraceCollector } from "./trace";
 
 /* Service Worker Script */
 
@@ -47,6 +48,7 @@ export class ServiceWorkerMLCEngineHandler extends WebWorkerMLCEngineHandler {
       throw new NonWorkerEnvironmentError("ServiceWorkerMLCEngineHandler");
     }
     super();
+    getTraceCollector("io_worker");
     const onmessage = this.onmessage.bind(this);
 
     this.engine.setInitProgressCallback((report: InitProgressReport) => {

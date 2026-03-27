@@ -1,5 +1,22 @@
 import * as webllm from "@mlc-ai/web-llm";
 
+function markUIFlushStart(tag: string) {
+  const mark = `webllm.ui.flush.start:${tag}`;
+  performance.mark(mark);
+  (console as any).timeStamp?.(mark);
+}
+
+function markUIFlushEnd(tag: string) {
+  const start = `webllm.ui.flush.start:${tag}`;
+  const end = `webllm.ui.flush.end:${tag}`;
+  performance.mark(end);
+  performance.measure(`webllm.ui.flush:${tag}`, { start, end });
+  performance.clearMarks(start);
+  performance.clearMarks(end);
+  performance.clearMeasures(`webllm.ui.flush:${tag}`);
+  (console as any).timeStamp?.(end);
+}
+
 function setLabel(id: string, text: string) {
   const label = document.getElementById(id);
   if (label == null) {
@@ -72,9 +89,19 @@ async function main() {
     },
     logprobs: true,
     top_logprobs: 2,
+    extra_body: {
+      enable_trace: true,
+      trace_level: "major",
+      trace_devtools: "major",
+      enable_gpu_timestamps: true,
+    },
   });
+  markUIFlushStart("get-started.reply");
+  setLabel("generate-label", reply0.choices[0]?.message.content || "");
+  markUIFlushEnd("get-started.reply");
   console.log(reply0);
   console.log(reply0.usage);
+  console.log(await engine.drainTraceEvents({ clear: true }));
 
   // To change model, either create a new engine via `CreateMLCEngine()`, or call `engine.reload(modelId)`
 }

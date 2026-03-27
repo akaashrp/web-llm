@@ -9,6 +9,7 @@ import {
 } from "./web_worker";
 import { areArraysEqual, areChatOptionsListEqual } from "./utils";
 import { WebGPUNotFoundError } from "./error";
+import { getTraceCollector } from "./trace";
 
 export interface ExtensionMLCEngineConfig extends MLCEngineConfig {
   extensionId?: string;
@@ -36,6 +37,7 @@ export class ServiceWorkerMLCEngineHandler extends WebWorkerMLCEngineHandler {
 
   constructor(port: chrome.runtime.Port) {
     super();
+    getTraceCollector("io_worker");
     this.port = port;
     port.onDisconnect.addListener(() => this.onPortDisconnect(port));
   }

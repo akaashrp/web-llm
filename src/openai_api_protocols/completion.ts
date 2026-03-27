@@ -242,6 +242,26 @@ export interface CompletionCreateParamsBase {
      * stages of token sampling.
      */
     enable_latency_breakdown?: boolean | null;
+
+    /**
+     * Enable request-scoped tracing for this request.
+     */
+    enable_trace?: boolean | null;
+
+    /**
+     * Trace verbosity level.
+     */
+    trace_level?: "major" | "verbose" | null;
+
+    /**
+     * Emit marker events to DevTools performance timeline.
+     */
+    trace_devtools?: "off" | "major" | "all" | null;
+
+    /**
+     * Enable best-effort GPU timestamp queries when supported.
+     */
+    enable_gpu_timestamps?: boolean | null;
   };
 }
 

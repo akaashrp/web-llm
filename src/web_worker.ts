@@ -37,9 +37,12 @@ import {
   GetMessageParams,
   RuntimeStatsTextParams,
   CompletionStreamNextChunkParams,
+  DrainTraceEventsParams,
 } from "./message";
 import log from "loglevel";
 import { MLCEngine } from "./engine";
+import { getTraceCollector, mergeTraceEvents } from "./trace";
+import type { TraceDrainOptions, TraceEvent } from "./trace";
 import {
   UnknownMessageKindError,
   WorkerEngineModelNotLoadedError,
@@ -77,12 +80,14 @@ export class WebWorkerMLCEngineHandler {
     string,
     AsyncGenerator<ChatCompletionChunk | Completion, void, void>
   >;
+  protected traceCollector = getTraceCollector("decode_worker");
 
   /**
    * @param engine A concrete implementation of MLCEngineInterface
    */
   constructor() {
     this.engine = new MLCEngine();
+    this.traceCollector = getTraceCollector("decode_worker");
     this.loadedModelIdToAsyncGenerator = new Map<
       string,
       AsyncGenerator<ChatCompletionChunk | Completion, void, void>
@@ -114,6 +119,13 @@ export class WebWorkerMLCEngineHandler {
   ) {
     try {
       const res = await task();
+      this.traceCollector.instant("worker.message.send", {
+        level: "major",
+        meta: {
+          uuid,
+          status: "return",
+        },
+      });
       const msg: WorkerResponse = {
         kind: "return",
         uuid: uuid,
@@ -122,6 +134,13 @@ export class WebWorkerMLCEngineHandler {
       this.postMessage(msg);
     } catch (err) {
       const errStr = (err as object).toString();
+      this.traceCollector.instant("worker.message.send", {
+        level: "major",
+        meta: {
+          uuid,
+          status: "throw",
+        },
+      });
       const msg: WorkerResponse = {
         kind: "throw",
         uuid: uuid,
@@ -142,6 +161,13 @@ export class WebWorkerMLCEngineHandler {
     } else {
       msg = event as WorkerRequest;
     }
+    this.traceCollector.instant("worker.message.recv", {
+      level: "major",
+      meta: {
+        kind: msg.kind,
+        uuid: msg.uuid,
+      },
+    });
     switch (msg.kind) {
       case "reload": {
         this.handleTask(msg.uuid, async () => {
@@ -266,6 +292,15 @@ export class WebWorkerMLCEngineHandler {
         this.handleTask(msg.uuid, async () => {
           const params = msg.content as RuntimeStatsTextParams;
           const res = await this.engine.runtimeStatsText(params.modelId);
+          onComplete?.(res);
+          return res;
+        });
+        return;
+      }
+      case "drainTraceEvents": {
+        this.handleTask(msg.uuid, async () => {
+          const params = msg.content as DrainTraceEventsParams;
+          const res = await this.engine.drainTraceEvents(params.options);
           onComplete?.(res);
           return res;
         });
@@ -439,6 +474,7 @@ export class WebWorkerMLCEngine implements MLCEngineInterface {
 
   private initProgressCallback?: InitProgressCallback;
   private pendingPromise = new Map<string, (msg: WorkerResponse) => void>();
+  protected traceCollector = getTraceCollector("main");
 
   constructor(worker: ChatWorker, engineConfig?: MLCEngineConfig) {
     this.worker = worker;
@@ -515,6 +551,13 @@ export class WebWorkerMLCEngine implements MLCEngineInterface {
       this.pendingPromise.set(uuid, cb);
     };
     const promise = new Promise<T>(executor);
+    this.traceCollector.instant("worker.request.send", {
+      level: "major",
+      meta: {
+        kind: msg.kind,
+        uuid: msg.uuid,
+      },
+    });
     this.worker.postMessage(msg);
     return promise;
   }
@@ -582,6 +625,37 @@ export class WebWorkerMLCEngine implements MLCEngineInterface {
       },
     };
     return await this.getPromise<string>(msg);
+  }
+
+  async drainTraceEvents(options?: TraceDrainOptions): Promise<TraceEvent[]> {
+    const localEvents = this.traceCollector.drain({
+      clear: false,
+      max_events: options?.max_events,
+    });
+    const msg: WorkerRequest = {
+      kind: "drainTraceEvents",
+      uuid: crypto.randomUUID(),
+      content: {
+        options: {
+          clear: options?.clear ?? true,
+          max_events: options?.max_events,
+        },
+      } as DrainTraceEventsParams,
+    };
+    const workerEvents = await this.getPromise<TraceEvent[]>(msg);
+    const merged = mergeTraceEvents([localEvents, workerEvents]);
+
+    const maxEvents = options?.max_events;
+    const sliced =
+      maxEvents !== undefined && maxEvents > 0 && merged.length > maxEvents
+        ? merged.slice(merged.length - maxEvents)
+        : merged;
+    if (options?.clear ?? true) {
+      this.traceCollector.drain({
+        clear: true,
+      });
+    }
+    return sliced;
   }
 
   interruptGenerate(): void {
@@ -656,11 +730,23 @@ export class WebWorkerMLCEngine implements MLCEngineInterface {
           selectedModelId: selectedModelId,
         } as CompletionStreamNextChunkParams,
       };
+      this.traceCollector.instant("stream.chunk.request", {
+        level: "major",
+        meta: {
+          selected_model_id: selectedModelId,
+        },
+      });
       const ret = await this.getPromise<ChatCompletionChunk>(msg);
       // If the worker's generator reached the end, it would return a `void`
       if (typeof ret !== "object") {
         break;
       }
+      this.traceCollector.instant("stream.chunk.recv", {
+        level: "major",
+        meta: {
+          selected_model_id: selectedModelId,
+        },
+      });
       yield ret;
     }
   }
@@ -808,6 +894,13 @@ export class WebWorkerMLCEngine implements MLCEngineInterface {
     } else {
       msg = event as WorkerResponse;
     }
+    this.traceCollector.instant("worker.response.recv", {
+      level: "major",
+      meta: {
+        kind: msg.kind,
+        uuid: (msg as any).uuid ?? "",
+      },
+    });
     switch (msg.kind) {
       case "initProgressCallback": {
         if (this.initProgressCallback !== undefined) {

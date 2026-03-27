@@ -30,6 +30,14 @@ export {
 } from "./types";
 
 export { MLCEngine, CreateMLCEngine } from "./engine";
+export type {
+  TraceEvent,
+  TraceDrainOptions,
+  TraceLevel,
+  TraceDevtoolsMode,
+  TraceContext,
+  TraceLane,
+} from "./trace";
 
 export {
   hasModelInCache,

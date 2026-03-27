@@ -30,6 +30,8 @@ import {
   TextCompletionExpectsKVEmptyError,
   CannotFindImageEmbedError,
 } from "./error";
+import { getTraceCollector } from "./trace";
+import type { TraceCollector } from "./trace";
 
 type ImageURL = ChatCompletionContentPartImage.ImageURL;
 
@@ -175,6 +177,7 @@ export class LLMChatPipeline {
   private sampleIndices: Int32Array;
   private sampleIndicesDevice: tvmjs.Tensor;
   private topPDevice: tvmjs.Tensor;
+  private traceCollector: TraceCollector;
 
   constructor(
     tvm: tvmjs.Instance,
@@ -187,6 +190,7 @@ export class LLMChatPipeline {
     this.tokenizer = tokenizer;
     this.config = config;
     this.logitProcessor = logitProcessor;
+    this.traceCollector = getTraceCollector();
     this.fullVocabSize = this.config.vocab_size;
     this.bitmaskSize = Math.ceil(this.fullVocabSize / 32);
 
@@ -483,6 +487,13 @@ export class LLMChatPipeline {
     tvm.endScope();
   }
 
+  private getTrace(): TraceCollector {
+    if ((this as any).traceCollector === undefined) {
+      this.traceCollector = getTraceCollector();
+    }
+    return this.traceCollector;
+  }
+
   dispose() {
     // TODO: Do we need to dispose all PackedFuncs here?
     this.grammarMatcher?.dispose();
@@ -733,6 +744,10 @@ export class LLMChatPipeline {
     if (this.resetStatsPerPrefill) {
       this.resetRuntimeStats();
     }
+    const prefillSpan = this.getTrace().beginSpan("prefill.step", {
+      level: "major",
+      step: this.outputIds.length,
+    });
 
     const tstart = performance.now();
 
@@ -897,6 +912,11 @@ export class LLMChatPipeline {
     this.curRoundPrefillTotalTime += (tend - tstart) / 1e3;
 
     this.processNextToken(nextToken, genConfig);
+    this.getTrace().endSpan(prefillSpan, {
+      meta: {
+        prompt_tokens: promptLen,
+      },
+    });
   }
 
   async decodeStep(genConfig?: GenerationConfig): Promise<void> {
@@ -905,34 +925,44 @@ export class LLMChatPipeline {
     }
 
     const tstart = performance.now();
-
-    this.tvm.beginScope();
-    const chunk: Array<Array<number>> = [
-      this.outputIds.slice(this.outputIds.length - 1),
-    ];
-    const chunkLen = chunk.length;
-    const prevFilledLen = this.filledKVCacheLength;
-    const logits = this.tvm.detachFromCurrentScope(
-      await this.embedAndForward(chunk, chunkLen),
-    );
-    if (this.filledKVCacheLength !== prevFilledLen + chunkLen) {
-      throw new Error(
-        "Internal Error: filledKVCacheLength does not match expected value.",
+    const decodeStep = this.outputIds.length;
+    const decodeSpan = this.getTrace().beginSpan("decode.step", {
+      level: "major",
+      step: decodeStep,
+    });
+    try {
+      this.tvm.beginScope();
+      const chunk: Array<Array<number>> = [
+        this.outputIds.slice(this.outputIds.length - 1),
+      ];
+      const chunkLen = chunk.length;
+      const prevFilledLen = this.filledKVCacheLength;
+      const logits = this.tvm.detachFromCurrentScope(
+        await this.embedAndForward(chunk, chunkLen),
       );
+      if (this.filledKVCacheLength !== prevFilledLen + chunkLen) {
+        throw new Error(
+          "Internal Error: filledKVCacheLength does not match expected value.",
+        );
+      }
+      this.tvm.endScope();
+
+      // sample from logits
+      const nextToken = await this.sampleTokenFromLogits(logits, genConfig);
+      logits.dispose();
+      const tend = performance.now();
+
+      this.decodingTotalTime += (tend - tstart) / 1e3;
+      this.decodingTotalTokens += 1;
+      this.curRoundDecodingTotalTokens += 1;
+      this.curRoundDecodingTotalTime += (tend - tstart) / 1e3;
+
+      this.processNextToken(nextToken, genConfig);
+    } finally {
+      this.getTrace().endSpan(decodeSpan, {
+        step: decodeStep,
+      });
     }
-    this.tvm.endScope();
-
-    // sample from logits
-    const nextToken = await this.sampleTokenFromLogits(logits, genConfig);
-    logits.dispose();
-    const tend = performance.now();
-
-    this.decodingTotalTime += (tend - tstart) / 1e3;
-    this.decodingTotalTokens += 1;
-    this.curRoundDecodingTotalTokens += 1;
-    this.curRoundDecodingTotalTime += (tend - tstart) / 1e3;
-
-    this.processNextToken(nextToken, genConfig);
   }
 
   /**
@@ -1012,7 +1042,18 @@ export class LLMChatPipeline {
     }
 
     // Stop condition 2: stop string; update `this.outputMessage` subsequently
+    const detokenizeStep = this.outputIds.length;
+    const detokenizeSpan = this.getTrace().beginSpan("token.detokenize", {
+      level: "major",
+      step: detokenizeStep,
+    });
     let outputMessage = this.tokenizer.decode(new Int32Array(this.outputIds));
+    this.getTrace().endSpan(detokenizeSpan, {
+      step: detokenizeStep,
+      meta: {
+        output_bytes: outputMessage.length,
+      },
+    });
     let stopPos = -1;
     for (const stopStr of stopStrs) {
       // Stop at the first stopStr we find
@@ -1610,6 +1651,11 @@ export class LLMChatPipeline {
     logitsOnGPU: tvmjs.Tensor,
     genConfig?: GenerationConfig,
   ) {
+    const sampleStep = this.outputIds.length;
+    const sampleSpan = this.getTrace().beginSpan("sampling.logits_to_token", {
+      level: "major",
+      step: sampleStep,
+    });
     // 0. Get value of temperature, top_p, and various penalties, possibly overridden by genConfig
     // Also load other genConfig items like logit_bias. Consume all fields of `genConfig` here.
     function _hasValue(value: any): boolean {
@@ -1984,6 +2030,13 @@ export class LLMChatPipeline {
       const outputTokenTimeSpent = (outputTokenEnd - outputTokenBegin) / 1e3;
       this.curRoundLatencyBreakdown.totalTime.push(outputTokenTimeSpent);
     }
+    this.getTrace().endSpan(sampleSpan, {
+      step: sampleStep,
+      meta: {
+        deferred: false,
+        grammar_constrained: grammarConstrained,
+      },
+    });
 
     return sampledToken;
   }

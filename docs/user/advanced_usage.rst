@@ -89,6 +89,57 @@ Then, in the main page script, register the service worker and instantiate the e
 
 Similar to the ``WebWorkerMLCEngine`` above, the ``ServiceWorkerMLCEngine`` is also a proxy and does not perform any actual computation. Instead, it forwards all calls to the service worker thread and receives the result through messages.
 
+Unified Tracing (Profiling)
+---------------------------
+
+WebLLM provides request-scoped tracing across main thread and worker contexts. Tracing is opt-in and disabled by default.
+
+Enable tracing per request using ``extra_body``:
+
+.. code-block:: typescript
+
+   const req: webllm.ChatCompletionRequest = {
+       stream: true,
+       messages: [{ role: "user", content: "hello" }],
+       extra_body: {
+           enable_trace: true,
+           trace_level: "major",      // "major" | "verbose"
+           trace_devtools: "major",   // "off" | "major" | "all"
+           enable_gpu_timestamps: true,
+       },
+   };
+
+   const chunks = await engine.chat.completions.create(req);
+   for await (const chunk of chunks) {
+       // app logic
+   }
+   const events = await engine.drainTraceEvents({ clear: true });
+   console.log(events);
+
+Trace event schema:
+
+- ``abs_ts_ms``: absolute timestamp in ms (`performance.timeOrigin + performance.now()`)
+- ``ctx``: context label (`main`, `decode_worker`, `io_worker`, `ui_worker`)
+- ``phase``: event phase name
+- ``step``: token index / step identifier when available
+- ``request_id`` and ``session_id``: request/session correlation fields
+- ``meta``: additional metadata (bytes, shard id, etc.)
+- ``lane``: ``cpu`` or ``gpu``
+
+DevTools workflow:
+
+1. Open Chrome DevTools Performance panel and start recording.
+2. Run a traced request (optionally with workers).
+3. Stop recording and inspect `console.timeStamp()` markers and worker-thread timelines.
+4. Call ``drainTraceEvents()`` to retrieve merged structured events for offline analysis.
+
+Current limits:
+
+- GPU range timings require adapters with ``timestamp-query`` support.
+- Without ``timestamp-query``, GPU durations fall back to CPU-side submit/readback timing.
+- UI flush timing is app-owned; examples show how to bracket DOM updates.
+- Temporary tensor events are runtime buffer-level alloc/free, not model-semantic tensor names.
+
 Chrome Extension
 ----------------
 

@@ -1,5 +1,6 @@
 import { AppConfig, ChatOptions } from "./config";
 import { InitProgressReport, LogLevel } from "./types";
+import type { TraceDrainOptions, TraceEvent } from "./trace";
 import {
   ChatCompletionRequestStreaming,
   ChatCompletionRequestNonStreaming,
@@ -34,7 +35,8 @@ type RequestKind =
   | "customRequest"
   | "keepAlive"
   | "setLogLevel"
-  | "setAppConfig";
+  | "setAppConfig"
+  | "drainTraceEvents";
 
 // eslint-disable-next-line @typescript-eslint/no-unused-vars
 type ResponseKind = "return" | "throw" | "initProgressCallback";
@@ -105,6 +107,9 @@ export interface CustomRequestParams {
   requestName: string;
   requestMessage: string;
 }
+export interface DrainTraceEventsParams {
+  options?: TraceDrainOptions;
+}
 export type MessageContent =
   | ReloadParams
   | ResetChatParams
@@ -118,8 +123,11 @@ export type MessageContent =
   | EmbeddingParams
   | CompletionStreamNextChunkParams
   | CustomRequestParams
+  | DrainTraceEventsParams
   | InitProgressReport
   | LogLevel
+  | TraceDrainOptions
+  | TraceEvent[]
   | string
   | null
   | number

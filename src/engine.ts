@@ -73,6 +73,31 @@ import {
 import { asyncLoadTokenizer } from "./cache_util";
 import { EmbeddingPipeline } from "./embedding";
 import { verifyIntegrity } from "./integrity";
+import { getTraceCollector } from "./trace";
+import type {
+  TraceCollector,
+  TraceDevtoolsMode,
+  TraceDrainOptions,
+  TraceEvent,
+  TraceLevel,
+} from "./trace";
+
+interface TraceExtraBodyOptions {
+  enable_trace?: boolean | null;
+  trace_level?: TraceLevel | null;
+  trace_devtools?: TraceDevtoolsMode | null;
+  enable_gpu_timestamps?: boolean | null;
+}
+
+interface RequestTraceConfig {
+  enabled: boolean;
+  level: TraceLevel;
+  devtools: TraceDevtoolsMode;
+  request_id?: string;
+  session_id: string;
+  enable_gpu_timestamps: boolean;
+  request_type: "chat" | "completion";
+}
 
 /**
  * Creates `MLCEngine`, and loads `modelId` onto WebGPU.
@@ -139,6 +164,7 @@ export class MLCEngine implements MLCEngineInterface {
   private interruptSignal = false;
   private deviceLostIsError = true; // whether device.lost is due to actual error or model reload
   private reloadController: AbortController | undefined;
+  private traceCollector: TraceCollector;
 
   constructor(engineConfig?: MLCEngineConfig) {
     this.loadedModelIdToPipeline = new Map<
@@ -148,6 +174,7 @@ export class MLCEngine implements MLCEngineInterface {
     this.loadedModelIdToChatConfig = new Map<string, ChatConfig>();
     this.loadedModelIdToModelType = new Map<string, ModelType>();
     this.loadedModelIdToLock = new Map<string, CustomLock>();
+    this.traceCollector = getTraceCollector("main");
     this.appConfig = engineConfig?.appConfig || prebuiltAppConfig;
     this.setLogLevel(engineConfig?.logLevel || DefaultLogLevel);
     this.setInitProgressCallback(engineConfig?.initProgressCallback);
@@ -187,6 +214,24 @@ export class MLCEngine implements MLCEngineInterface {
    */
   setLogLevel(logLevel: LogLevel) {
     log.setLevel(logLevel);
+  }
+
+  private buildTraceRequestConfig(
+    extraBody: TraceExtraBodyOptions | undefined,
+    sessionId: string,
+    requestType: "chat" | "completion",
+  ): RequestTraceConfig {
+    const enabled = extraBody?.enable_trace === true;
+    return {
+      enabled,
+      level: extraBody?.trace_level ?? "major",
+      devtools: enabled ? (extraBody?.trace_devtools ?? "major") : "off",
+      request_id: enabled ? crypto.randomUUID() : undefined,
+      session_id: sessionId,
+      enable_gpu_timestamps:
+        enabled && extraBody?.enable_gpu_timestamps === true,
+      request_type: requestType,
+    };
   }
 
   //----------------------------------------
@@ -482,6 +527,7 @@ export class MLCEngine implements MLCEngineInterface {
     chatConfig: ChatConfig,
     genConfig: GenerationConfig,
     timeReceived: number,
+    traceRequestConfig: RequestTraceConfig,
   ): AsyncGenerator<ChatCompletionChunk, void, void>;
   asyncGenerate(
     request: CompletionCreateParamsStreaming,
@@ -490,6 +536,7 @@ export class MLCEngine implements MLCEngineInterface {
     chatConfig: ChatConfig,
     genConfig: GenerationConfig,
     timeReceived: number,
+    traceRequestConfig: RequestTraceConfig,
   ): AsyncGenerator<Completion, void, void>;
   async *asyncGenerate(
     request: ChatCompletionRequestStreaming | CompletionCreateParamsStreaming,
@@ -498,11 +545,49 @@ export class MLCEngine implements MLCEngineInterface {
     chatConfig: ChatConfig,
     genConfig: GenerationConfig,
     timeReceived: number,
+    traceRequestConfig: RequestTraceConfig,
   ): AsyncGenerator<ChatCompletionChunk | Completion, void, void> {
     // Since it is an async generator, we need to do fine-grained try-catch to ensure lock is
     // released only when errors occur. Then release at the very end when no error occurs.
     // TODO: This makes code less readable, is there a better way to do this?
     const lock = this.loadedModelIdToLock.get(model)!;
+    let lockReleased = false;
+    const releaseLock = async () => {
+      if (!lockReleased) {
+        lockReleased = true;
+        await lock.release();
+      }
+    };
+    const prevTraceConfig = this.traceCollector.beginRequest({
+      enabled: traceRequestConfig.enabled,
+      level: traceRequestConfig.level,
+      devtools: traceRequestConfig.devtools,
+      request_id: traceRequestConfig.request_id,
+      session_id: traceRequestConfig.session_id,
+      enable_gpu_timestamps: traceRequestConfig.enable_gpu_timestamps,
+    });
+    this.traceCollector.instant("request.start", {
+      level: "major",
+      meta: {
+        request_type: traceRequestConfig.request_type,
+        mode: "stream",
+      },
+    });
+    let traceClosed = false;
+    const closeTrace = (status: "ok" | "error" | "cancelled") => {
+      if (traceClosed) {
+        return;
+      }
+      this.traceCollector.instant("request.end", {
+        level: "major",
+        meta: {
+          request_type: traceRequestConfig.request_type,
+          status,
+        },
+      });
+      this.traceCollector.endRequest(prevTraceConfig);
+      traceClosed = true;
+    };
 
     // 0. Pre-processing
     const isChatCompletion = "messages" in request;
@@ -521,7 +606,8 @@ export class MLCEngine implements MLCEngineInterface {
         pipeline.setSeed(request.seed);
       }
     } catch (err) {
-      await lock.release();
+      await releaseLock();
+      closeTrace("error");
       throw err;
     }
 
@@ -605,10 +691,18 @@ export class MLCEngine implements MLCEngineInterface {
       await this.prefill(request, pipeline, chatConfig, genConfig);
       curChunk = await _getChunk(pipeline); // prefill produces a chunk
     } catch (err) {
-      await lock.release();
+      await releaseLock();
+      closeTrace("error");
       throw err;
     }
     if (curChunk) {
+      this.traceCollector.instant("stream.chunk.emit", {
+        level: "major",
+        step: pipeline.getCurRoundDecodingTotalTokens(),
+        meta: {
+          chunk_kind: "delta",
+        },
+      });
       yield curChunk;
     }
 
@@ -623,10 +717,18 @@ export class MLCEngine implements MLCEngineInterface {
         await this.decode(pipeline, genConfig);
         curChunk = await _getChunk(pipeline);
       } catch (err) {
-        await lock.release();
+        await releaseLock();
+        closeTrace("error");
         throw err;
       }
       if (curChunk) {
+        this.traceCollector.instant("stream.chunk.emit", {
+          level: "major",
+          step: pipeline.getCurRoundDecodingTotalTokens(),
+          meta: {
+            chunk_kind: "delta",
+          },
+        });
         yield curChunk;
       }
     }
@@ -653,7 +755,8 @@ export class MLCEngine implements MLCEngineInterface {
         ) as Array<ChatCompletionChunk.Choice.Delta.ToolCall>;
       }
     } catch (err) {
-      await lock.release();
+      await releaseLock();
+      closeTrace("error");
       throw err;
     }
 
@@ -676,6 +779,13 @@ export class MLCEngine implements MLCEngineInterface {
         object: "chat.completion.chunk",
         created: created,
       };
+      this.traceCollector.instant("stream.chunk.emit", {
+        level: "major",
+        step: pipeline.getCurRoundDecodingTotalTokens(),
+        meta: {
+          chunk_kind: "final",
+        },
+      });
       yield lastChunk;
     } else {
       const lastChunk: Completion = {
@@ -691,6 +801,13 @@ export class MLCEngine implements MLCEngineInterface {
         object: "text_completion",
         created: created,
       };
+      this.traceCollector.instant("stream.chunk.emit", {
+        level: "major",
+        step: pipeline.getCurRoundDecodingTotalTokens(),
+        meta: {
+          chunk_kind: "final",
+        },
+      });
       yield lastChunk;
     }
 
@@ -745,6 +862,13 @@ export class MLCEngine implements MLCEngineInterface {
           object: "chat.completion.chunk",
           created: created,
         };
+        this.traceCollector.instant("stream.chunk.emit", {
+          level: "major",
+          step: pipeline.getCurRoundDecodingTotalTokens(),
+          meta: {
+            chunk_kind: "usage",
+          },
+        });
         yield usageChunk;
       } else {
         const usageChunk: Completion = {
@@ -755,11 +879,19 @@ export class MLCEngine implements MLCEngineInterface {
           object: "text_completion",
           created: created,
         };
+        this.traceCollector.instant("stream.chunk.emit", {
+          level: "major",
+          step: pipeline.getCurRoundDecodingTotalTokens(),
+          meta: {
+            chunk_kind: "usage",
+          },
+        });
         yield usageChunk;
       }
     }
 
-    await lock.release();
+    closeTrace("ok");
+    await releaseLock();
   }
 
   async interruptGenerate() {
@@ -817,6 +949,11 @@ export class MLCEngine implements MLCEngineInterface {
       enable_thinking: request.extra_body?.enable_thinking,
       enable_latency_breakdown: request.extra_body?.enable_latency_breakdown,
     };
+    const traceRequestConfig = this.buildTraceRequestConfig(
+      request.extra_body,
+      selectedModelId,
+      "chat",
+    );
 
     // 0.5 Block wait until this pipeline finishes all previous requests
     const lock = this.loadedModelIdToLock.get(selectedModelId)!;
@@ -831,8 +968,24 @@ export class MLCEngine implements MLCEngineInterface {
         selectedChatConfig,
         genConfig,
         timeReceived,
+        traceRequestConfig,
       );
     }
+
+    const prevTraceConfig = this.traceCollector.beginRequest({
+      enabled: traceRequestConfig.enabled,
+      level: traceRequestConfig.level,
+      devtools: traceRequestConfig.devtools,
+      request_id: traceRequestConfig.request_id,
+      session_id: traceRequestConfig.session_id,
+      enable_gpu_timestamps: traceRequestConfig.enable_gpu_timestamps,
+    });
+    this.traceCollector.instant("request.start", {
+      level: "major",
+      meta: {
+        request_type: traceRequestConfig.request_type,
+      },
+    });
 
     // Big try-finally to release lock in case of errors
     try {
@@ -952,8 +1105,25 @@ export class MLCEngine implements MLCEngineInterface {
       if (request.seed !== null && request.seed !== undefined) {
         selectedPipeline.setSeed(Date.now());
       }
+      this.traceCollector.instant("request.end", {
+        level: "major",
+        meta: {
+          request_type: traceRequestConfig.request_type,
+          status: "ok",
+        },
+      });
       return response;
+    } catch (err) {
+      this.traceCollector.instant("request.end", {
+        level: "major",
+        meta: {
+          request_type: traceRequestConfig.request_type,
+          status: "error",
+        },
+      });
+      throw err;
     } finally {
+      this.traceCollector.endRequest(prevTraceConfig);
       await lock.release();
     }
   }
@@ -997,6 +1167,11 @@ export class MLCEngine implements MLCEngineInterface {
       top_logprobs: request.top_logprobs,
       ignore_eos: request.ignore_eos,
     };
+    const traceRequestConfig = this.buildTraceRequestConfig(
+      request.extra_body,
+      selectedModelId,
+      "completion",
+    );
 
     // 0.5 Block wait until this pipeline finishes all previous requests
     const lock = this.loadedModelIdToLock.get(selectedModelId)!;
@@ -1011,8 +1186,24 @@ export class MLCEngine implements MLCEngineInterface {
         selectedChatConfig,
         genConfig,
         timeReceived,
+        traceRequestConfig,
       );
     }
+
+    const prevTraceConfig = this.traceCollector.beginRequest({
+      enabled: traceRequestConfig.enabled,
+      level: traceRequestConfig.level,
+      devtools: traceRequestConfig.devtools,
+      request_id: traceRequestConfig.request_id,
+      session_id: traceRequestConfig.session_id,
+      enable_gpu_timestamps: traceRequestConfig.enable_gpu_timestamps,
+    });
+    this.traceCollector.instant("request.start", {
+      level: "major",
+      meta: {
+        request_type: traceRequestConfig.request_type,
+      },
+    });
 
     // Big try-finally to release lock in case of errors
     try {
@@ -1089,8 +1280,25 @@ export class MLCEngine implements MLCEngineInterface {
       if (request.seed !== null && request.seed !== undefined) {
         selectedPipeline.setSeed(Date.now());
       }
+      this.traceCollector.instant("request.end", {
+        level: "major",
+        meta: {
+          request_type: traceRequestConfig.request_type,
+          status: "ok",
+        },
+      });
       return response;
+    } catch (err) {
+      this.traceCollector.instant("request.end", {
+        level: "major",
+        meta: {
+          request_type: traceRequestConfig.request_type,
+          status: "error",
+        },
+      });
+      throw err;
     } finally {
+      this.traceCollector.endRequest(prevTraceConfig);
       await lock.release();
     }
   }
@@ -1315,6 +1523,10 @@ export class MLCEngine implements MLCEngineInterface {
     );
     const [, selectedPipeline] = this.getLLMStates("runtimeStatsText", modelId);
     return selectedPipeline.runtimeStatsText();
+  }
+
+  async drainTraceEvents(options?: TraceDrainOptions): Promise<TraceEvent[]> {
+    return this.traceCollector.drain(options);
   }
 
   async resetChat(keepStats = false, modelId?: string) {

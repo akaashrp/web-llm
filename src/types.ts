@@ -15,6 +15,7 @@ import {
   CreateEmbeddingResponse,
 } from "./openai_api_protocols/index";
 import * as API from "./openai_api_protocols/index";
+import type { TraceDrainOptions, TraceEvent } from "./trace";
 
 /**
  * Report during intialization.
@@ -178,6 +179,13 @@ export interface MLCEngineInterface {
    * @note This is an async function
    */
   runtimeStatsText: (modelId?: string) => Promise<string>;
+
+  /**
+   * Drain and return trace events captured in this context.
+   *
+   * @param options Drain behavior options.
+   */
+  drainTraceEvents: (options?: TraceDrainOptions) => Promise<TraceEvent[]>;
 
   /**
    * Interrupt the generate process if it is already running.

@@ -262,6 +262,23 @@ export interface CompletionCreateParamsBase {
      * Enable best-effort GPU timestamp queries when supported.
      */
     enable_gpu_timestamps?: boolean | null;
+
+    /**
+     * Sampling readback mode:
+     * - "baseline": current per-step sampled-token readback behavior.
+     * - "ring_vector": reserved toggle for batched ring+vector readback path.
+     */
+    sample_readback_mode?: "baseline" | "ring_vector" | null;
+
+    /**
+     * Maximum number of in-flight sampled-token readback batches when using ring+vector mode.
+     */
+    sample_readback_inflight_depth?: number | null;
+
+    /**
+     * Number of staging slots for ring+vector sampled-token readback.
+     */
+    sample_readback_slots?: number | null;
   };
 }
 

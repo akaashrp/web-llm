@@ -71,6 +71,50 @@ describe("Check generation config illegal values", () => {
       postInitAndCheckGenerationConfigValues(genConfig);
     }).toThrow("top_logprobs requires logprobs to be true");
   });
+
+  test("sample_readback_mode invalid value", () => {
+    expect(() => {
+      const genConfig: GenerationConfig = {
+        // cast for invalid runtime input coverage
+        sample_readback_mode: "invalid_mode" as "baseline",
+      };
+      postInitAndCheckGenerationConfigValues(genConfig);
+    }).toThrow(
+      'sample_readback_mode must be either "baseline" or "ring_vector".',
+    );
+  });
+
+  test("sample_readback_inflight_depth must be positive integer", () => {
+    expect(() => {
+      const genConfig: GenerationConfig = {
+        sample_readback_inflight_depth: 0,
+      };
+      postInitAndCheckGenerationConfigValues(genConfig);
+    }).toThrow("Make sure `sample_readback_inflight_depth` > 0");
+
+    expect(() => {
+      const genConfig: GenerationConfig = {
+        sample_readback_inflight_depth: 1.5,
+      };
+      postInitAndCheckGenerationConfigValues(genConfig);
+    }).toThrow("sample_readback_inflight_depth must be an integer.");
+  });
+
+  test("sample_readback_slots must be positive integer", () => {
+    expect(() => {
+      const genConfig: GenerationConfig = {
+        sample_readback_slots: -1,
+      };
+      postInitAndCheckGenerationConfigValues(genConfig);
+    }).toThrow("Make sure `sample_readback_slots` > 0");
+
+    expect(() => {
+      const genConfig: GenerationConfig = {
+        sample_readback_slots: 2.2,
+      };
+      postInitAndCheckGenerationConfigValues(genConfig);
+    }).toThrow("sample_readback_slots must be an integer.");
+  });
 });
 
 describe("Check generation post init", () => {
@@ -97,5 +141,13 @@ describe("Check generation post init", () => {
     };
     postInitAndCheckGenerationConfigValues(genConfig);
     expect(genConfig.top_logprobs).toBe(2);
+  });
+
+  test("Set sampled-token readback defaults", () => {
+    const genConfig: GenerationConfig = {};
+    postInitAndCheckGenerationConfigValues(genConfig);
+    expect(genConfig.sample_readback_mode).toBe("baseline");
+    expect(genConfig.sample_readback_inflight_depth).toBe(4);
+    expect(genConfig.sample_readback_slots).toBe(3);
   });
 });

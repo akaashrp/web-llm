@@ -67,4 +67,11 @@ export {
   CreateServiceWorkerMLCEngine as CreateExtensionServiceWorkerMLCEngine,
 } from "./extension_service_worker";
 
+export {
+  SAMPLED_TOKEN_READBACK_RING_RUNTIME_HINT,
+  supportsSampledTokenReadbackRingRuntime,
+  ensureSampledTokenReadbackRingRuntime,
+  createSampledTokenReadbackRing,
+} from "./runtime_readback";
+
 export * from "./openai_api_protocols/index";

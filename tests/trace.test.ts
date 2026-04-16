@@ -74,6 +74,71 @@ test("TraceCollector runtime bridge ingests events from runtime hooks", () => {
   collector.endRequest(prev);
 });
 
+test("TraceCollector withRuntimeStep sets and restores runtime step", () => {
+  const collector = new TraceCollector();
+  collector.setContext("decode_worker");
+  const prev = collector.beginRequest({
+    enabled: true,
+    level: "verbose",
+    devtools: "off",
+    request_id: "req-step-1",
+    session_id: "sess-step-1",
+  });
+
+  expect(
+    (globalThis as any).__WEBLLM_TRACE_RUNTIME_STATE__?.step,
+  ).toBeUndefined();
+  collector.withRuntimeStep(42, () => {
+    expect((globalThis as any).__WEBLLM_TRACE_RUNTIME_STATE__?.step).toBe(42);
+  });
+  expect(
+    (globalThis as any).__WEBLLM_TRACE_RUNTIME_STATE__?.step,
+  ).toBeUndefined();
+  collector.endRequest(prev);
+});
+
+test("TraceCollector withRuntimeStep restores active scope on async out-of-order completion", async () => {
+  const collector = new TraceCollector();
+  collector.setContext("decode_worker");
+  const prev = collector.beginRequest({
+    enabled: true,
+    level: "verbose",
+    devtools: "off",
+    request_id: "req-step-2",
+    session_id: "sess-step-2",
+  });
+
+  let resolveOuter!: () => void;
+  const outerPromise = collector.withRuntimeStep("outer", async () => {
+    await new Promise<void>((resolve) => {
+      resolveOuter = resolve;
+    });
+  });
+
+  await Promise.resolve();
+  expect((globalThis as any).__WEBLLM_TRACE_RUNTIME_STATE__?.step).toBe(
+    "outer",
+  );
+
+  await collector.withRuntimeStep("inner", async () => {
+    expect((globalThis as any).__WEBLLM_TRACE_RUNTIME_STATE__?.step).toBe(
+      "inner",
+    );
+  });
+
+  // The shorter-lived inner scope should be removed while outer scope remains active.
+  expect((globalThis as any).__WEBLLM_TRACE_RUNTIME_STATE__?.step).toBe(
+    "outer",
+  );
+
+  resolveOuter();
+  await outerPromise;
+  expect(
+    (globalThis as any).__WEBLLM_TRACE_RUNTIME_STATE__?.step,
+  ).toBeUndefined();
+  collector.endRequest(prev);
+});
+
 test("mergeTraceEvents orders deterministically by timestamp, ctx, and seq", () => {
   const merged = mergeTraceEvents([
     [

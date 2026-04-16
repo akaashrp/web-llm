@@ -162,6 +162,9 @@ export interface GenerationConfig {
   // extra_body in ChatCompletionsRequest
   enable_thinking?: boolean | null;
   enable_latency_breakdown?: boolean | null;
+  sample_readback_mode?: "baseline" | "ring_vector" | null;
+  sample_readback_inflight_depth?: number | null;
+  sample_readback_slots?: number | null;
 }
 
 export function postInitAndCheckGenerationConfigValues(
@@ -245,6 +248,41 @@ export function postInitAndCheckGenerationConfigValues(
     if (!_hasValue(config.top_logprobs)) {
       config.top_logprobs = 0;
     }
+  }
+
+  // sampled-token readback strategy knobs
+  if (!_hasValue(config.sample_readback_mode)) {
+    config.sample_readback_mode = "baseline";
+  }
+  if (
+    config.sample_readback_mode !== "baseline" &&
+    config.sample_readback_mode !== "ring_vector"
+  ) {
+    throw new Error(
+      `sample_readback_mode must be either "baseline" or "ring_vector". Got ${config.sample_readback_mode}.`,
+    );
+  }
+  if (!_hasValue(config.sample_readback_inflight_depth)) {
+    config.sample_readback_inflight_depth = 4;
+  }
+  if (!Number.isInteger(config.sample_readback_inflight_depth)) {
+    throw new Error(
+      `sample_readback_inflight_depth must be an integer. Got ${config.sample_readback_inflight_depth}.`,
+    );
+  }
+  if (config.sample_readback_inflight_depth! <= 0) {
+    throw new MinValueError("sample_readback_inflight_depth", 0);
+  }
+  if (!_hasValue(config.sample_readback_slots)) {
+    config.sample_readback_slots = 3;
+  }
+  if (!Number.isInteger(config.sample_readback_slots)) {
+    throw new Error(
+      `sample_readback_slots must be an integer. Got ${config.sample_readback_slots}.`,
+    );
+  }
+  if (config.sample_readback_slots! <= 0) {
+    throw new MinValueError("sample_readback_slots", 0);
   }
 }
 

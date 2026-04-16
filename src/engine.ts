@@ -948,6 +948,10 @@ export class MLCEngine implements MLCEngineInterface {
       ignore_eos: request.ignore_eos,
       enable_thinking: request.extra_body?.enable_thinking,
       enable_latency_breakdown: request.extra_body?.enable_latency_breakdown,
+      sample_readback_mode: request.extra_body?.sample_readback_mode,
+      sample_readback_inflight_depth:
+        request.extra_body?.sample_readback_inflight_depth,
+      sample_readback_slots: request.extra_body?.sample_readback_slots,
     };
     const traceRequestConfig = this.buildTraceRequestConfig(
       request.extra_body,
@@ -1166,6 +1170,10 @@ export class MLCEngine implements MLCEngineInterface {
       logprobs: request.logprobs,
       top_logprobs: request.top_logprobs,
       ignore_eos: request.ignore_eos,
+      sample_readback_mode: request.extra_body?.sample_readback_mode,
+      sample_readback_inflight_depth:
+        request.extra_body?.sample_readback_inflight_depth,
+      sample_readback_slots: request.extra_body?.sample_readback_slots,
     };
     const traceRequestConfig = this.buildTraceRequestConfig(
       request.extra_body,

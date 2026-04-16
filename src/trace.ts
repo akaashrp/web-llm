@@ -65,6 +65,7 @@ interface RuntimeTraceState {
   level: TraceLevel;
   devtools: TraceDevtoolsMode;
   ctx: TraceContext;
+  step?: number | string;
   request_id?: string;
   session_id?: string;
   enable_gpu_timestamps?: boolean;
@@ -132,6 +133,8 @@ export class TraceCollector {
   private capacity = 50000;
   private seq = 0;
   private context: TraceContext = "main";
+  private runtimeStepScopes: Array<{ id: number; step?: number | string }> = [];
+  private nextRuntimeStepScopeId = 1;
   private activeRequest: TraceRequestConfig = {
     enabled: false,
     level: "major",
@@ -150,6 +153,35 @@ export class TraceCollector {
 
   getContext(): TraceContext {
     return this.context;
+  }
+
+  withRuntimeStep<T>(step: number | string | undefined, fn: () => T): T;
+  withRuntimeStep<T>(
+    step: number | string | undefined,
+    fn: () => Promise<T>,
+  ): Promise<T>;
+  withRuntimeStep<T>(
+    step: number | string | undefined,
+    fn: () => T | Promise<T>,
+  ): T | Promise<T> {
+    const scopeId = this.enterRuntimeStepScope(step);
+    try {
+      const result = fn();
+      if (
+        result !== null &&
+        typeof result === "object" &&
+        typeof (result as Promise<T>).then === "function"
+      ) {
+        return (result as Promise<T>).finally(() => {
+          this.exitRuntimeStepScope(scopeId);
+        });
+      }
+      this.exitRuntimeStepScope(scopeId);
+      return result as T;
+    } catch (err) {
+      this.exitRuntimeStepScope(scopeId);
+      throw err;
+    }
   }
 
   beginRequest(config: Partial<TraceRequestConfig>): TraceRequestConfig {
@@ -367,10 +399,39 @@ export class TraceCollector {
       level: this.activeRequest.level,
       devtools: this.activeRequest.devtools,
       ctx: this.context,
+      step: this.getCurrentRuntimeStep(),
       request_id: this.activeRequest.request_id,
       session_id: this.activeRequest.session_id,
       enable_gpu_timestamps: this.activeRequest.enable_gpu_timestamps ?? false,
     } as RuntimeTraceState;
+  }
+
+  private enterRuntimeStepScope(step: number | string | undefined): number {
+    const scopeId = this.nextRuntimeStepScopeId++;
+    this.runtimeStepScopes.push({
+      id: scopeId,
+      step,
+    });
+    this.updateRuntimeState();
+    return scopeId;
+  }
+
+  private exitRuntimeStepScope(scopeId: number): void {
+    const idx = this.runtimeStepScopes.findIndex(
+      (scope) => scope.id === scopeId,
+    );
+    if (idx === -1) {
+      return;
+    }
+    this.runtimeStepScopes.splice(idx, 1);
+    this.updateRuntimeState();
+  }
+
+  private getCurrentRuntimeStep(): number | string | undefined {
+    if (this.runtimeStepScopes.length === 0) {
+      return undefined;
+    }
+    return this.runtimeStepScopes[this.runtimeStepScopes.length - 1].step;
   }
 
   private nextSeq(): number {

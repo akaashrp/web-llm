@@ -9,6 +9,7 @@
     "build": "rollup -c && ./cleanup-index-js.sh",
     "lint": "npx eslint ./src/ ./tests/ ./examples/ && npx prettier ./src/ ./tests/ ./examples/ --check",
     "test": "jest --coverage",
+    "trace:breakdown": "node scripts/trace_breakdown.mjs",
     "format": "prettier --write \"./src/\" \"./examples/\" \"./tests/\"",
     "prepare": "husky"
   },
@@ -29,7 +30,7 @@
   "devDependencies": {
     "@eslint/eslintrc": "^3.3.1",
     "@eslint/js": "^9.9.0",
-    "@mlc-ai/web-runtime": "^0.25.0-dev0",
+    "@mlc-ai/web-runtime": "file:/Users/akaashrp/Documents/tvm-profiling/web",
     "@mlc-ai/web-tokenizers": "^0.1.6",
     "@mlc-ai/web-xgrammar": "0.1.27",
     "@next/eslint-plugin-next": "^16.0.0",

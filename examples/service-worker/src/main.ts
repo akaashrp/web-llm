@@ -73,8 +73,8 @@ async function mainNonStreaming() {
       { role: "assistant", content: "California, New York, Pennsylvania." },
       { role: "user", content: "Two more please!" },
     ],
-    n: 3,
-    temperature: 1.5,
+    n: 1,
+    temperature: 0.7,
     max_tokens: 256,
     extra_body: {
       enable_trace: true,
@@ -122,7 +122,7 @@ async function mainStreaming() {
       { role: "assistant", content: "California, New York, Pennsylvania." },
       { role: "user", content: "Two more please!" },
     ],
-    temperature: 1.5,
+    temperature: 0.7,
     max_tokens: 256,
     extra_body: {
       enable_trace: true,
@@ -146,7 +146,7 @@ async function mainStreaming() {
     // engine.interruptGenerate();  // works with interrupt as well
   }
   console.log("Final message:\n", await engine.getMessage()); // the concatenated message
-  console.log(await engine.drainTraceEvents({ clear: true }));
+  console.table(await engine.drainTraceEvents({ clear: true }));
 }
 
 registerServiceWorker();

@@ -30,42 +30,40 @@ async function main() {
     setLabel("init-label", report.text);
   };
   // Option 1: If we do not specify appConfig, we use `prebuiltAppConfig` defined in `config.ts`
-  const selectedModel = "Llama-3.1-8B-Instruct-q4f32_1-MLC";
-  const engine: webllm.MLCEngineInterface = await webllm.CreateMLCEngine(
-    selectedModel,
-    {
-      initProgressCallback: initProgressCallback,
-      logLevel: "INFO", // specify the log level
-    },
-    // customize kv cache, use either context_window_size or sliding_window_size (with attention sink)
-    {
-      context_window_size: 2048,
-      // sliding_window_size: 1024,
-      // attention_sink_size: 4,
-    },
-  );
-
-  // Option 2: Specify your own model other than the prebuilt ones
-  // const appConfig: webllm.AppConfig = {
-  //   model_list: [
-  //     {
-  //       model: "https://huggingface.co/mlc-ai/Llama-3.1-8B-Instruct-q4f32_1-MLC",
-  //       model_id: "Llama-3.1-8B-Instruct-q4f32_1-MLC",
-  //       model_lib:
-  //         webllm.modelLibURLPrefix +
-  //         webllm.modelVersion +
-  //         "/Llama-3_1-8B-Instruct-q4f32_1-ctx4k_cs1k-webgpu.wasm",
-  //       overrides: {
-  //         context_window_size: 2048,
-  //       },
-  //     },
-  //   ],
-  // };
+  // const selectedModel = "phi-2-q4f16_1-MLC";
+  const selectedModel = "Qwen3-0.6B-q4f16_1-MLC";
   // const engine: webllm.MLCEngineInterface = await webllm.CreateMLCEngine(
   //   selectedModel,
-  //   { appConfig: appConfig, initProgressCallback: initProgressCallback },
+  //   {
+  //     initProgressCallback: initProgressCallback,
+  //     logLevel: "INFO", // specify the log level
+  //   },
+  //   // customize kv cache, use either context_window_size or sliding_window_size (with attention sink)
+  //   {
+  //     context_window_size: 2048,
+  //     // sliding_window_size: 1024,
+  //     // attention_sink_size: 4,
+  //   },
   // );
 
+  // Option 2: Specify your own model other than the prebuilt ones
+  const appConfig: webllm.AppConfig = {
+    model_list: [
+      {
+        model: "https://huggingface.co/mlc-ai/Qwen3-0.6B-q4f16_1-MLC",
+        model_id: "Qwen3-0.6B-q4f16_1-MLC",
+        model_lib:
+          "https://raw.githubusercontent.com/akaashrp/mlc-binaries/main/testing/Qwen3-0.6B-q4f16_1-webgpu-mlc-new-runtime.wasm",
+        overrides: {
+          context_window_size: 2048,
+        },
+      },
+    ],
+  };
+  const engine: webllm.MLCEngineInterface = await webllm.CreateMLCEngine(
+    selectedModel,
+    { appConfig: appConfig, initProgressCallback: initProgressCallback },
+  );
   // Option 3: Instantiate MLCEngine() and call reload() separately
   // const engine: webllm.MLCEngineInterface = new webllm.MLCEngine({
   //   appConfig: appConfig, // if do not specify, we use webllm.prebuiltAppConfig
@@ -73,35 +71,53 @@ async function main() {
   // });
   // await engine.reload(selectedModel);
 
+  (globalThis as any).__WEBLLM_TRACE_COLLECTOR__?.setCapacity(250000);
+
   const reply0 = await engine.chat.completions.create({
-    messages: [{ role: "user", content: "List three US states." }],
+    messages: [
+      { role: "user", content: "List twenty of the most important US states." },
+    ],
     // below configurations are all optional
-    n: 3,
-    temperature: 1.5,
-    max_tokens: 256,
+    n: 1,
+    temperature: 0,
+    max_tokens: 1024,
     // 46510 and 7188 are "California", and 8421 and 51325 are "Texas" in Llama-3.1-8B-Instruct
     // So we would have a higher chance of seeing the latter two, but never the first in the answer
-    logit_bias: {
-      "46510": -100,
-      "7188": -100,
-      "8421": 5,
-      "51325": 5,
-    },
-    logprobs: true,
-    top_logprobs: 2,
+    // logit_bias: {
+    //   "46510": -100,
+    //   "7188": -100,
+    //   "8421": 5,
+    //   "51325": 5,
+    // },
+    logprobs: false,
+    // top_logprobs: 2,
     extra_body: {
       enable_trace: true,
       trace_level: "major",
-      trace_devtools: "major",
+      trace_devtools: "off",
       enable_gpu_timestamps: true,
+      sample_readback_mode: "baseline",
+      sample_readback_inflight_depth: 16,
+      sample_readback_slots: 16,
     },
   });
   markUIFlushStart("get-started.reply");
   setLabel("generate-label", reply0.choices[0]?.message.content || "");
   markUIFlushEnd("get-started.reply");
   console.log(reply0);
+  console.log(reply0.choices[0].message.content);
   console.log(reply0.usage);
-  console.log(await engine.drainTraceEvents({ clear: true }));
+  const events = await engine.drainTraceEvents({ clear: true });
+  // console.table(events);
+
+  const blob = new Blob([JSON.stringify(events, null, 2)], {
+    type: "application/json",
+  });
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(blob);
+  a.download = `trace-events-${Date.now()}.json`;
+  a.click();
+  URL.revokeObjectURL(a.href);
 
   // To change model, either create a new engine via `CreateMLCEngine()`, or call `engine.reload(modelId)`
 }

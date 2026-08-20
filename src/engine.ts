@@ -12,7 +12,15 @@ import {
   DefaultLogLevel,
   ModelType,
 } from "./config";
-import { LLMChatPipeline } from "./llm_chat";
+import {
+  CommittedGenerationStep,
+  KVCheckpointData,
+  LLMChatPipeline,
+  ReplayedGenerationToken,
+  SampleDecodeOptions,
+  SamplePrefillOptions,
+  SampledGenerationStep,
+} from "./llm_chat";
 import {
   // ChatCompletion
   ChatCompletionRequest,
@@ -42,6 +50,9 @@ import {
   LogitProcessor,
   LogLevel,
   LatencyBreakdown,
+  ResumeProbeResult,
+  ResumeResult,
+  ResumeChatCompletionOptions,
 } from "./types";
 import {
   compareConversationObject,
@@ -76,9 +87,236 @@ import {
 } from "./cache_util";
 import { EmbeddingPipeline } from "./embedding";
 import { verifyIntegrity } from "./integrity";
+import {
+  NormalizedResumableGenerationConfig,
+  ResumableGenerationJournal,
+  normalizeResumableGenerationConfig,
+} from "./resumable/generation";
+import {
+  OPFSFileStore,
+  createOPFSFileStore,
+} from "./resumable/opfs_file_store";
+import { ResumableSessionStore } from "./resumable/session_store";
+import { probeResumableSession } from "./resumable/session_probe";
+import {
+  ResumableReplayState,
+  hasUnsupportedGrammarReplay,
+  readResumableReplayState,
+} from "./resumable/replay";
+import {
+  ResumableCheckpointPayload,
+  ResumableCheckpointWriter,
+  readResumableCheckpointPayload,
+} from "./resumable/checkpoint_writer";
+import { isResumableInjectedFault } from "./resumable/fault_injection";
+import { ResumableSessionHandle } from "./resumable/types";
+
+function isOPFSUnavailableError(err: unknown): boolean {
+  return (
+    err instanceof Error &&
+    err.message === "OPFS is unavailable in this environment"
+  );
+}
 
 function getUnixTimestampSeconds(): number {
   return Math.floor(Date.now() / 1000);
+}
+
+const MIN_FREE_SPACE_BEFORE_KV_CHECKPOINT_BYTES = 512 * 1024 * 1024;
+const checkpointMetadataEncoder = new TextEncoder();
+
+function promptCheckpointId(processedSeqLen: number): string {
+  return `checkpoint_00000000_${processedSeqLen.toString().padStart(8, "0")}`;
+}
+
+function requestSeed(request: unknown): number | undefined {
+  const seed = (request as { seed?: unknown } | undefined)?.seed;
+  return typeof seed === "number" ? seed : undefined;
+}
+
+function isChatCompletionReplayRequest(
+  request: unknown,
+): request is ChatCompletionRequest {
+  const messages = (request as { messages?: unknown } | undefined)?.messages;
+  return (
+    typeof request === "object" &&
+    request !== null &&
+    Array.isArray(messages) &&
+    messages.length > 0
+  );
+}
+
+function countTrailingReplacementChar(value: string): number {
+  let count = 0;
+  for (let i = value.length - 1; i >= 0; i--) {
+    if (value.charAt(i) !== "�") {
+      return count;
+    }
+    count++;
+  }
+  return count;
+}
+
+async function estimateFreeStorageBytes(): Promise<number | undefined> {
+  const storage = (
+    globalThis.navigator as
+      | {
+          storage?: {
+            estimate?: () => Promise<{ quota?: number; usage?: number }>;
+          };
+        }
+      | undefined
+  )?.storage;
+  if (storage?.estimate === undefined) {
+    return undefined;
+  }
+  try {
+    const estimate = await storage.estimate();
+    if (
+      typeof estimate.quota !== "number" ||
+      typeof estimate.usage !== "number"
+    ) {
+      return undefined;
+    }
+    return Math.max(0, estimate.quota - estimate.usage);
+  } catch {
+    return undefined;
+  }
+}
+
+async function hasKVCheckpointQuota(
+  estimatedCheckpointBytes = 0,
+): Promise<boolean> {
+  const freeBytes = await estimateFreeStorageBytes();
+  if (freeBytes === undefined) {
+    return true;
+  }
+  return (
+    freeBytes >=
+    Math.max(
+      MIN_FREE_SPACE_BEFORE_KV_CHECKPOINT_BYTES,
+      2 * estimatedCheckpointBytes,
+    )
+  );
+}
+
+interface DecodeCheckpointScheduler {
+  intervalTokens: number;
+  lastCheckpointSeqLen: number;
+  pageSize?: number;
+}
+
+interface KVResumeCheckpoint {
+  checkpoint: KVCheckpointData;
+  coveredGeneratedTokens: ReplayedGenerationToken[];
+  tailGeneratedTokens: ReplayedGenerationToken[];
+}
+
+interface ResumableEngineMetrics {
+  journalAppendMs: number;
+  checkpointWriteMs: number;
+  kvRestoreMs: number;
+  tokenReplayMs: number;
+  resumeFirstTokenMs?: number;
+}
+
+interface StreamGenerationState {
+  id: string;
+  created: number;
+  prevMessageLength: number;
+}
+
+interface StreamContinuationOptions {
+  emitCurrent?: boolean;
+  skipEmptyDelta?: boolean;
+  completionTokenOffset?: number;
+  beforeFinalChunk?: () => Promise<void>;
+}
+
+interface ResumeContinuationState {
+  recoveryMode: "kv" | "token_replay";
+  replayedTokens: number;
+  extraEmittedTokens: number;
+  firstTokenRecorded: boolean;
+  lastCheckpointSeqLen: number;
+  checkpointPageSize?: number;
+  pendingJournaledToken?: JournaledGenerationStep;
+}
+
+interface JournaledGenerationStep {
+  sampled: SampledGenerationStep;
+  committed: CommittedGenerationStep;
+}
+
+function metadataInteger(
+  metadata: Record<string, unknown>,
+  field: string,
+): number | undefined {
+  const value = metadata[field];
+  return typeof value === "number" && Number.isInteger(value) && value > 0
+    ? value
+    : undefined;
+}
+
+function checkpointPageSize(checkpoint: KVCheckpointData): number | undefined {
+  return (
+    metadataInteger(checkpoint.metadata, "pageSize") ??
+    metadataInteger(checkpoint.metadata, "page_size")
+  );
+}
+
+function checkpointByteLength(checkpoint: KVCheckpointData): number {
+  const pageGroupBytes = checkpoint.pageGroups.reduce(
+    (sum, group) => sum + group.data.byteLength,
+    0,
+  );
+  const logitsBytes = checkpoint.nextLogits?.data.byteLength ?? 0;
+  const metadataBytes = checkpointMetadataEncoder.encode(
+    JSON.stringify(checkpoint.metadata),
+  ).byteLength;
+  return pageGroupBytes + logitsBytes + metadataBytes;
+}
+
+function normalizeCheckpointInterval(
+  intervalTokens: number,
+  pageSize?: number,
+): number {
+  if (pageSize === undefined) {
+    return intervalTokens;
+  }
+  return Math.ceil(intervalTokens / pageSize) * pageSize;
+}
+
+function shouldCaptureDecodeCheckpoint(
+  scheduler: DecodeCheckpointScheduler,
+  nextProcessedSeqLen: number,
+): boolean {
+  const intervalTokens = normalizeCheckpointInterval(
+    scheduler.intervalTokens,
+    scheduler.pageSize,
+  );
+  if (nextProcessedSeqLen - scheduler.lastCheckpointSeqLen < intervalTokens) {
+    return false;
+  }
+  return (
+    scheduler.pageSize === undefined ||
+    nextProcessedSeqLen % scheduler.pageSize === 0
+  );
+}
+
+function noteCommittedCheckpoint(
+  scheduler: DecodeCheckpointScheduler,
+  checkpoint: KVCheckpointData,
+): void {
+  scheduler.lastCheckpointSeqLen = checkpoint.processedSeqLen;
+  scheduler.pageSize = checkpointPageSize(checkpoint) ?? scheduler.pageSize;
+}
+
+function replayPromptSeqLen(state: ResumableReplayState): number {
+  if (state.emittedTokens === 0) {
+    return state.promptTokenIds.length;
+  }
+  return Math.max(0, state.processedSeqLen - state.emittedTokens);
 }
 
 /**
@@ -141,6 +379,9 @@ export class MLCEngine implements MLCEngineInterface {
   private logitProcessorRegistry?: Map<string, LogitProcessor>;
   private initProgressCallback?: InitProgressCallback;
   private appConfig: AppConfig;
+  private resumableFileStore?: OPFSFileStore;
+  private resumableSessionStore?: ResumableSessionStore;
+  private lastResumableMetrics?: ResumableEngineMetrics;
 
   // Signals and flags
   private interruptSignal = false;
@@ -185,6 +426,608 @@ export class MLCEngine implements MLCEngineInterface {
     logitProcessorRegistry?: Map<string, LogitProcessor>,
   ) {
     this.logitProcessorRegistry = logitProcessorRegistry;
+  }
+
+  private getResumableFileStore(): OPFSFileStore {
+    if (this.resumableFileStore === undefined) {
+      this.resumableFileStore = createOPFSFileStore();
+    }
+    return this.resumableFileStore;
+  }
+
+  private getResumableSessionStore(): ResumableSessionStore {
+    if (this.resumableSessionStore === undefined) {
+      this.resumableSessionStore = new ResumableSessionStore(
+        this.getResumableFileStore(),
+      );
+    }
+    return this.resumableSessionStore;
+  }
+
+  private resetResumableMetrics(): ResumableEngineMetrics {
+    const metrics = {
+      journalAppendMs: 0,
+      checkpointWriteMs: 0,
+      kvRestoreMs: 0,
+      tokenReplayMs: 0,
+    };
+    this.lastResumableMetrics = metrics;
+    return metrics;
+  }
+
+  private resumableMetrics(): ResumableEngineMetrics {
+    return this.lastResumableMetrics ?? this.resetResumableMetrics();
+  }
+
+  private normalizeResumableForRequest(
+    request: ChatCompletionRequest,
+  ): NormalizedResumableGenerationConfig | undefined {
+    const config = normalizeResumableGenerationConfig(
+      request.extra_body?.resumable,
+    );
+    if (config === undefined) {
+      return undefined;
+    }
+    if ((request.n ?? 1) > 1) {
+      throw new Error("Resumable generation currently requires n <= 1.");
+    }
+    return config;
+  }
+
+  private tryCreateResumableJournal(
+    config: NormalizedResumableGenerationConfig | undefined,
+  ): ResumableGenerationJournal | undefined {
+    if (config === undefined) {
+      return undefined;
+    }
+    try {
+      const files = this.getResumableFileStore();
+      return new ResumableGenerationJournal(
+        files,
+        this.getResumableSessionStore(),
+        config,
+      );
+    } catch (err) {
+      if (config.strictPersistence) {
+        throw err;
+      }
+      log.warn("Resumable journal disabled:", err);
+      return undefined;
+    }
+  }
+
+  private async recordGeneratedToken(
+    journal: ResumableGenerationJournal | undefined,
+    pipeline: LLMChatPipeline,
+    sampled: SampledGenerationStep,
+    committed: CommittedGenerationStep,
+  ): Promise<void> {
+    if (journal === undefined) {
+      return;
+    }
+    const start = performance.now();
+    try {
+      await journal.recordGeneratedToken({
+        globalTokenPos: sampled.globalTokenPos,
+        tokenId: sampled.tokenId,
+        textDelta: committed.textDelta,
+        rngState: pipeline.getRNGState(),
+        logprob: sampled.logprob,
+      });
+    } finally {
+      this.resumableMetrics().journalAppendMs += performance.now() - start;
+    }
+  }
+
+  private async writeKVCheckpoint(
+    journal: ResumableGenerationJournal,
+    checkpoint: KVCheckpointData | undefined,
+  ): Promise<boolean> {
+    if (checkpoint === undefined) {
+      return false;
+    }
+    if (!(await hasKVCheckpointQuota(checkpointByteLength(checkpoint)))) {
+      return false;
+    }
+    try {
+      const writer = new ResumableCheckpointWriter(
+        this.getResumableFileStore(),
+        this.getResumableSessionStore(),
+      );
+      const start = performance.now();
+      try {
+        await writer.writeCheckpoint({
+          sessionId: journal.sessionId,
+          checkpointId: promptCheckpointId(checkpoint.processedSeqLen),
+          processedSeqLen: checkpoint.processedSeqLen,
+          layoutHash: checkpoint.layoutHash,
+          metadata: {
+            ...checkpoint.metadata,
+            nextLogitsShape: checkpoint.nextLogits?.shape,
+            nextLogitsDtype: checkpoint.nextLogits?.dtype,
+          },
+          pageGroups: checkpoint.pageGroups,
+          nextLogits: checkpoint.nextLogits?.data,
+        });
+      } finally {
+        this.resumableMetrics().checkpointWriteMs += performance.now() - start;
+      }
+      await journal.refreshSeqNo();
+      return true;
+    } catch (err) {
+      if (journal.strictPersistence) {
+        throw err;
+      }
+      log.warn("KV checkpoint disabled:", err);
+      return false;
+    }
+  }
+
+  private async cleanupKVAfterFinish(
+    journal: ResumableGenerationJournal,
+  ): Promise<void> {
+    try {
+      await this.getResumableSessionStore().deleteKV(journal.sessionId);
+    } catch (err) {
+      if (journal.strictPersistence) {
+        throw err;
+      }
+      log.warn("KV checkpoint cleanup failed:", err);
+    }
+  }
+
+  private async writePromptCheckpoint(
+    journal: ResumableGenerationJournal,
+    sampled: SampledGenerationStep,
+  ): Promise<boolean> {
+    return this.writeKVCheckpoint(journal, sampled.promptCheckpoint);
+  }
+
+  private async writeDecodeCheckpoint(
+    journal: ResumableGenerationJournal,
+    scheduler: DecodeCheckpointScheduler,
+    sampled: SampledGenerationStep,
+  ): Promise<void> {
+    if (await this.writeKVCheckpoint(journal, sampled.decodeCheckpoint)) {
+      noteCommittedCheckpoint(scheduler, sampled.decodeCheckpoint!);
+    }
+  }
+
+  private async createResumeContinuationJournal(
+    files: OPFSFileStore,
+    sessions: ResumableSessionStore,
+    session: ResumableSessionHandle,
+    state: ResumableReplayState,
+  ): Promise<ResumableGenerationJournal> {
+    if (state.resumableConfig === undefined) {
+      throw new Error(
+        `Resumable session ${state.sessionId} is missing journal configuration.`,
+      );
+    }
+    const journal = new ResumableGenerationJournal(
+      files,
+      sessions,
+      state.resumableConfig,
+    );
+    await journal.attachExistingSession(session, state.emittedTokens);
+    return journal;
+  }
+
+  private createResumeCheckpointScheduler(
+    journal: ResumableGenerationJournal,
+    restored: ResumeContinuationState,
+  ): DecodeCheckpointScheduler {
+    return {
+      intervalTokens: journal.checkpointIntervalTokens,
+      lastCheckpointSeqLen: restored.lastCheckpointSeqLen,
+      pageSize: restored.checkpointPageSize,
+    };
+  }
+
+  private async recordPendingResumeToken(
+    journal: ResumableGenerationJournal,
+    pipeline: LLMChatPipeline,
+    restored: ResumeContinuationState,
+  ): Promise<void> {
+    if (restored.pendingJournaledToken === undefined) {
+      return;
+    }
+    await this.recordGeneratedToken(
+      journal,
+      pipeline,
+      restored.pendingJournaledToken.sampled,
+      restored.pendingJournaledToken.committed,
+    );
+    restored.pendingJournaledToken = undefined;
+  }
+
+  private async decodeResumedGenerationStep(
+    journal: ResumableGenerationJournal,
+    scheduler: DecodeCheckpointScheduler,
+    promptSeqLen: number,
+    pipeline: LLMChatPipeline,
+    genConfig: GenerationConfig,
+  ): Promise<void> {
+    const captureDecodeCheckpoint =
+      shouldCaptureDecodeCheckpoint(
+        scheduler,
+        promptSeqLen + journal.emittedTokenCount,
+      ) && (await hasKVCheckpointQuota());
+    const decodeStep = await this.sampleDecode(pipeline, genConfig, {
+      captureCheckpoint: captureDecodeCheckpoint,
+      storeCheckpointLogits: journal.storeCheckpointLogits,
+    });
+    const committedDecode = pipeline.commitSampledStep(decodeStep, genConfig);
+    await this.recordGeneratedToken(
+      journal,
+      pipeline,
+      decodeStep,
+      committedDecode,
+    );
+    await this.writeDecodeCheckpoint(journal, scheduler, decodeStep);
+  }
+
+  private checkpointPayloadToKVData(
+    payload: ResumableCheckpointPayload,
+  ): KVCheckpointData {
+    const metadata = payload.meta.metadata;
+    if (metadata === undefined) {
+      throw new Error("KV checkpoint metadata is missing runtime metadata.");
+    }
+    const nextLogitsShape = metadata.nextLogitsShape;
+    const nextLogitsDtype = metadata.nextLogitsDtype;
+    return {
+      processedSeqLen: payload.meta.processedSeqLen,
+      layoutHash: payload.meta.layoutHash,
+      metadata,
+      pageGroups: payload.pageGroups.map((group) => ({
+        groupId: group.groupId,
+        layerStart: group.layerStart,
+        layerEnd: group.layerEnd,
+        data: group.data,
+      })),
+      nextLogits:
+        payload.nextLogits === undefined
+          ? undefined
+          : {
+              shape: Array.isArray(nextLogitsShape)
+                ? (nextLogitsShape as number[])
+                : [],
+              dtype:
+                typeof nextLogitsDtype === "string"
+                  ? nextLogitsDtype
+                  : "float32",
+              data: payload.nextLogits.data,
+            },
+    };
+  }
+
+  private async readBestKVCheckpoint(
+    files: OPFSFileStore,
+    sessions: ResumableSessionStore,
+    session: ResumableSessionHandle,
+    state: ResumableReplayState,
+  ): Promise<KVResumeCheckpoint | undefined> {
+    const promptSeqLen = state.promptTokenIds.length;
+    const refs = await sessions.listCommittedCheckpoints(session.sessionId);
+    let best: KVCheckpointData | undefined;
+    for (const ref of refs) {
+      const payload = await readResumableCheckpointPayload(files, ref);
+      if (
+        payload !== undefined &&
+        payload.meta.processedSeqLen >= promptSeqLen &&
+        payload.meta.processedSeqLen <= state.processedSeqLen &&
+        (best === undefined ||
+          payload.meta.processedSeqLen > best.processedSeqLen)
+      ) {
+        best = this.checkpointPayloadToKVData(payload);
+      }
+    }
+    if (best === undefined) {
+      return undefined;
+    }
+    return {
+      checkpoint: best,
+      coveredGeneratedTokens: state.generatedTokens.filter(
+        (token) => token.globalTokenPos < best.processedSeqLen,
+      ),
+      tailGeneratedTokens: state.generatedTokens.filter(
+        (token) => token.globalTokenPos >= best.processedSeqLen,
+      ),
+    };
+  }
+
+  private async tryRestoreKVResumeState(
+    files: OPFSFileStore,
+    sessions: ResumableSessionStore,
+    session: ResumableSessionHandle,
+    state: ResumableReplayState,
+    pipeline: LLMChatPipeline,
+    genConfig: GenerationConfig,
+  ): Promise<ResumeContinuationState | undefined> {
+    if (
+      state.finished ||
+      state.scanStoppedReason !== undefined ||
+      state.promptTokenIds.length === 0 ||
+      state.generationConfig === undefined ||
+      hasUnsupportedGrammarReplay(state.generationConfig) ||
+      this.logitProcessorRegistry?.has(state.modelId)
+    ) {
+      return undefined;
+    }
+    if (
+      state.generatedTokens.length > 0 &&
+      state.generatedTokens[state.generatedTokens.length - 1].rngState ===
+        undefined
+    ) {
+      return undefined;
+    }
+
+    const resume = await this.readBestKVCheckpoint(
+      files,
+      sessions,
+      session,
+      state,
+    );
+    if (resume === undefined) {
+      return undefined;
+    }
+    try {
+      if (resume.tailGeneratedTokens.length === 0) {
+        const seed = requestSeed(state.request);
+        const rngState = resume.coveredGeneratedTokens.at(-1)?.rngState;
+        if (rngState !== undefined) {
+          if (!pipeline.setRNGState(rngState)) {
+            return undefined;
+          }
+        } else if (seed !== undefined) {
+          pipeline.setSeed(seed);
+        } else if (state.generatedTokens.length > 0) {
+          return undefined;
+        }
+      }
+      const restoreStart = performance.now();
+      const replay = await pipeline.replayFromPromptCheckpoint(
+        resume.checkpoint,
+        state.assistantPrefixTokenIds,
+        resume.coveredGeneratedTokens,
+        resume.tailGeneratedTokens,
+        genConfig,
+      );
+      const restoreElapsed = performance.now() - restoreStart;
+      this.resumableMetrics().kvRestoreMs += restoreElapsed;
+      if (replay.sampledFromCheckpointLogits) {
+        this.resumableMetrics().resumeFirstTokenMs = restoreElapsed;
+      }
+      const rngState = resume.tailGeneratedTokens.at(-1)?.rngState;
+      if (rngState !== undefined && !pipeline.setRNGState(rngState)) {
+        pipeline.resetChat();
+        return undefined;
+      }
+
+      return {
+        recoveryMode: "kv",
+        replayedTokens: replay.replayedTokens,
+        extraEmittedTokens: replay.sampledFromCheckpointLogits ? 1 : 0,
+        firstTokenRecorded: replay.sampledFromCheckpointLogits,
+        lastCheckpointSeqLen: resume.checkpoint.processedSeqLen,
+        checkpointPageSize: checkpointPageSize(resume.checkpoint),
+        pendingJournaledToken:
+          replay.sampledToken !== undefined &&
+          replay.committedToken !== undefined
+            ? {
+                sampled: replay.sampledToken,
+                committed: replay.committedToken,
+              }
+            : undefined,
+      };
+    } catch (err) {
+      log.warn("KV checkpoint restore failed; falling back:", err);
+      pipeline.resetChat();
+      return undefined;
+    }
+  }
+
+  private finalizeResumedConversation(
+    state: ResumableReplayState,
+    pipeline: LLMChatPipeline,
+    chatConfig: ChatConfig,
+  ): void {
+    if (!isChatCompletionReplayRequest(state.request)) {
+      return;
+    }
+    const conversation = getConversationFromChatCompletionRequest(
+      state.request,
+      chatConfig,
+      true,
+    );
+    conversation.appendReplyHeader(Role.assistant);
+    conversation.finishReply(pipeline.getMessage());
+    pipeline.setConversation(conversation);
+  }
+
+  private async finishResumeContinuation(
+    state: ResumableReplayState,
+    pipeline: LLMChatPipeline,
+    chatConfig: ChatConfig,
+    genConfig: GenerationConfig,
+    restored: ResumeContinuationState,
+    journal: ResumableGenerationJournal,
+    checkpointScheduler: DecodeCheckpointScheduler,
+    promptSeqLen: number,
+  ): Promise<ResumeResult> {
+    this.interruptSignal = false;
+    const firstTokenStart = performance.now();
+    let recordedFirstToken = restored.firstTokenRecorded;
+    try {
+      await this.recordPendingResumeToken(journal, pipeline, restored);
+      while (!pipeline.stopped()) {
+        if (this.interruptSignal) {
+          pipeline.triggerStop();
+          break;
+        }
+        await this.decodeResumedGenerationStep(
+          journal,
+          checkpointScheduler,
+          promptSeqLen,
+          pipeline,
+          genConfig,
+        );
+        if (!recordedFirstToken) {
+          this.resumableMetrics().resumeFirstTokenMs =
+            performance.now() - firstTokenStart;
+          recordedFirstToken = true;
+        }
+      }
+      await journal.recordGenerationEnd({
+        finishReason: pipeline.getFinishReason(),
+        emittedTokens: journal.emittedTokenCount,
+      });
+      if (pipeline.getFinishReason() !== "abort") {
+        await this.cleanupKVAfterFinish(journal);
+      }
+      this.finalizeResumedConversation(state, pipeline, chatConfig);
+      return {
+        sessionId: state.sessionId,
+        recoveredText: pipeline.getMessage(),
+        emittedTokens: journal.emittedTokenCount,
+        processedSeqLen: promptSeqLen + journal.emittedTokenCount,
+        replayedTokens: restored.replayedTokens,
+        recoveryMode: restored.recoveryMode,
+      };
+    } catch (err) {
+      if (!isResumableInjectedFault(err)) {
+        await journal.recordEngineError({ err }).catch(() => undefined);
+      }
+      throw err;
+    } finally {
+      await journal.close();
+    }
+  }
+
+  private async *streamResumeContinuation(
+    request: ChatCompletionRequestStreaming,
+    model: string,
+    pipeline: LLMChatPipeline,
+    chatConfig: ChatConfig,
+    genConfig: GenerationConfig,
+    state: ResumableReplayState,
+    restored: ResumeContinuationState,
+    journal: ResumableGenerationJournal,
+    checkpointScheduler: DecodeCheckpointScheduler,
+    promptSeqLen: number,
+    release: () => Promise<void>,
+  ): AsyncGenerator<ChatCompletionChunk, void, void> {
+    this.interruptSignal = false;
+    const firstTokenStart = performance.now();
+    let recordedFirstToken = restored.firstTokenRecorded;
+    const streamState: StreamGenerationState = {
+      id: crypto.randomUUID(),
+      created: getUnixTimestampSeconds(),
+      prevMessageLength: state.recoveredText.length,
+    };
+
+    try {
+      await this.recordPendingResumeToken(journal, pipeline, restored);
+      const chunks = this.streamCurrentGeneration(
+        request,
+        model,
+        pipeline,
+        genConfig,
+        Date.now(),
+        streamState,
+        async () => {
+          await this.decodeResumedGenerationStep(
+            journal,
+            checkpointScheduler,
+            promptSeqLen,
+            pipeline,
+            genConfig,
+          );
+          if (!recordedFirstToken) {
+            this.resumableMetrics().resumeFirstTokenMs =
+              performance.now() - firstTokenStart;
+            recordedFirstToken = true;
+          }
+        },
+        {
+          emitCurrent: restored.extraEmittedTokens > 0,
+          skipEmptyDelta: true,
+          completionTokenOffset: restored.extraEmittedTokens,
+          beforeFinalChunk: async () => {
+            await journal.recordGenerationEnd({
+              finishReason: pipeline.getFinishReason(),
+              emittedTokens: journal.emittedTokenCount,
+            });
+            if (pipeline.getFinishReason() !== "abort") {
+              await this.cleanupKVAfterFinish(journal);
+            }
+            this.finalizeResumedConversation(state, pipeline, chatConfig);
+          },
+        },
+      );
+      for await (const chunk of chunks) {
+        yield chunk as ChatCompletionChunk;
+      }
+    } catch (err) {
+      if (!isResumableInjectedFault(err)) {
+        await journal.recordEngineError({ err }).catch(() => undefined);
+      }
+      throw err;
+    } finally {
+      try {
+        await journal.close();
+      } finally {
+        await release();
+      }
+    }
+  }
+
+  private makeTextOnlyResumeResult(state: ResumableReplayState): ResumeResult {
+    return {
+      sessionId: state.sessionId,
+      recoveredText: state.recoveredText,
+      emittedTokens: state.emittedTokens,
+      processedSeqLen: state.processedSeqLen,
+      replayedTokens: 0,
+      recoveryMode: "text_only",
+    };
+  }
+
+  private getTokenReplayBlockReason(
+    state: ResumableReplayState,
+  ): string | undefined {
+    if (state.finished) {
+      return "generation already finished";
+    }
+    if (state.scanStoppedReason !== undefined) {
+      return `journal scan stopped at ${state.scanStoppedReason}`;
+    }
+    if (state.promptTokenIds.length === 0) {
+      return "missing prompt token record";
+    }
+    if (state.generatedTokens.length === 0) {
+      return "missing generated token records";
+    }
+    if (state.generationConfig === undefined) {
+      return "missing generation config record";
+    }
+    if (hasUnsupportedGrammarReplay(state.generationConfig)) {
+      return "unsupported grammar replay";
+    }
+    if (
+      state.generatedTokens[state.generatedTokens.length - 1].rngState ===
+      undefined
+    ) {
+      return "missing RNG state";
+    }
+    if (state.modelId === "") {
+      return "missing model id";
+    }
+    if (this.logitProcessorRegistry?.has(state.modelId)) {
+      return "custom LogitProcessor replay unsupported";
+    }
+    return undefined;
   }
 
   /**
@@ -478,6 +1321,350 @@ export class MLCEngine implements MLCEngineInterface {
     return pipeline.getMessage();
   }
 
+  private async _generateResumable(
+    input:
+      | ChatCompletionRequestNonStreaming
+      | CompletionCreateParamsNonStreaming,
+    modelId: string,
+    pipeline: LLMChatPipeline,
+    chatConfig: ChatConfig,
+    genConfig: GenerationConfig,
+    journal: ResumableGenerationJournal,
+  ): Promise<string> {
+    this.resetResumableMetrics();
+    this.interruptSignal = false;
+    if (genConfig !== undefined) {
+      postInitAndCheckGenerationConfigValues(genConfig);
+    }
+
+    let journalStarted = false;
+    try {
+      const prefillStep = await this.samplePrefill(
+        input,
+        pipeline,
+        chatConfig,
+        genConfig,
+        {
+          capturePromptCheckpoint:
+            journal.checkpointPrompt && (await hasKVCheckpointQuota()),
+          storeCheckpointLogits: journal.storeCheckpointLogits,
+        },
+      );
+      if (prefillStep.promptTokenIds === undefined) {
+        throw new Error(
+          "Resumable generation currently supports text-only prompts.",
+        );
+      }
+      await journal.begin({
+        modelId,
+        request: input,
+        promptTokenIds: prefillStep.promptTokenIds,
+        assistantPrefixTokenIds: prefillStep.assistantPrefixTokenIds ?? [],
+        generationConfig: genConfig,
+      });
+      journalStarted = true;
+      const checkpointScheduler: DecodeCheckpointScheduler = {
+        intervalTokens: journal.checkpointIntervalTokens,
+        lastCheckpointSeqLen: prefillStep.globalTokenPos,
+      };
+      if (await this.writePromptCheckpoint(journal, prefillStep)) {
+        noteCommittedCheckpoint(
+          checkpointScheduler,
+          prefillStep.promptCheckpoint!,
+        );
+      }
+      const committedPrefill = pipeline.commitSampledStep(
+        prefillStep,
+        genConfig,
+      );
+      await this.recordGeneratedToken(
+        journal,
+        pipeline,
+        prefillStep,
+        committedPrefill,
+      );
+
+      while (!pipeline.stopped()) {
+        if (this.interruptSignal) {
+          pipeline.triggerStop();
+          break;
+        }
+        const captureDecodeCheckpoint =
+          shouldCaptureDecodeCheckpoint(
+            checkpointScheduler,
+            prefillStep.globalTokenPos + journal.emittedTokenCount,
+          ) && (await hasKVCheckpointQuota());
+        const decodeStep = await this.sampleDecode(pipeline, genConfig, {
+          captureCheckpoint: captureDecodeCheckpoint,
+          storeCheckpointLogits: journal.storeCheckpointLogits,
+        });
+        const committedDecode = pipeline.commitSampledStep(
+          decodeStep,
+          genConfig,
+        );
+        await this.recordGeneratedToken(
+          journal,
+          pipeline,
+          decodeStep,
+          committedDecode,
+        );
+        await this.writeDecodeCheckpoint(
+          journal,
+          checkpointScheduler,
+          decodeStep,
+        );
+      }
+      await journal.recordGenerationEnd({
+        finishReason: pipeline.getFinishReason(),
+        emittedTokens: journal.emittedTokenCount,
+      });
+      if (pipeline.getFinishReason() !== "abort") {
+        await this.cleanupKVAfterFinish(journal);
+      }
+      return pipeline.getMessage();
+    } catch (err) {
+      if (journalStarted && !isResumableInjectedFault(err)) {
+        await journal.recordEngineError({ err }).catch(() => undefined);
+      }
+      throw err;
+    } finally {
+      await journal.close();
+    }
+  }
+
+  private makeStreamDeltaChunk(
+    request: ChatCompletionRequestStreaming | CompletionCreateParamsStreaming,
+    model: string,
+    pipeline: LLMChatPipeline,
+    state: StreamGenerationState,
+    skipEmptyDelta = false,
+  ): ChatCompletionChunk | Completion | undefined {
+    const curMessage = pipeline.getMessage();
+    if (countTrailingReplacementChar(curMessage) % 4 !== 0) {
+      return undefined;
+    }
+
+    const deltaMessage = curMessage.slice(state.prevMessageLength);
+    state.prevMessageLength = curMessage.length;
+    if (skipEmptyDelta && deltaMessage === "") {
+      return undefined;
+    }
+
+    const logprobs = request.logprobs
+      ? ({
+          content: pipeline.getTokenLogprobArray().slice(-1),
+        } as ChatCompletionChunk.Choice.Logprobs)
+      : null;
+    if ("messages" in request) {
+      return {
+        id: state.id,
+        choices: [
+          {
+            delta: { content: deltaMessage, role: "assistant" },
+            finish_reason: null,
+            index: 0,
+            logprobs,
+          },
+        ],
+        model,
+        object: "chat.completion.chunk",
+        created: state.created,
+      };
+    }
+    return {
+      id: state.id,
+      choices: [
+        {
+          text: deltaMessage,
+          finish_reason: null,
+          index: 0,
+          logprobs,
+        },
+      ],
+      model,
+      object: "text_completion",
+      created: state.created,
+    };
+  }
+
+  private makeStreamFinalChunk(
+    request: ChatCompletionRequestStreaming | CompletionCreateParamsStreaming,
+    model: string,
+    pipeline: LLMChatPipeline,
+    state: StreamGenerationState,
+  ): ChatCompletionChunk | Completion {
+    let finishReason = pipeline.getFinishReason()!;
+    const isChatCompletion = "messages" in request;
+    const isFunctionCalling =
+      isChatCompletion && request.tools !== undefined && request.tools !== null;
+    let toolCalls: Array<ChatCompletionChunk.Choice.Delta.ToolCall> | undefined;
+    if (pipeline.getFinishReason() === "stop" && isFunctionCalling) {
+      finishReason = "tool_calls";
+      toolCalls = getToolCallFromOutputMessage(
+        pipeline.getMessage(),
+        /*isStreaming=*/ true,
+      ) as Array<ChatCompletionChunk.Choice.Delta.ToolCall>;
+    }
+
+    if (isChatCompletion) {
+      return {
+        id: state.id,
+        choices: [
+          {
+            delta: isFunctionCalling
+              ? {
+                  role: "assistant",
+                  tool_calls: toolCalls,
+                }
+              : {},
+            finish_reason: finishReason,
+            index: 0,
+          },
+        ],
+        model,
+        object: "chat.completion.chunk",
+        created: state.created,
+      };
+    }
+    return {
+      id: state.id,
+      choices: [
+        {
+          text: "",
+          finish_reason: finishReason,
+          index: 0,
+        },
+      ],
+      model,
+      object: "text_completion",
+      created: state.created,
+    };
+  }
+
+  private makeStreamUsageChunk(
+    request: ChatCompletionRequestStreaming | CompletionCreateParamsStreaming,
+    model: string,
+    pipeline: LLMChatPipeline,
+    state: StreamGenerationState,
+    completionTokenOffset: number,
+    timeReceived: number,
+  ): ChatCompletionChunk | Completion | undefined {
+    if (request.stream_options?.include_usage !== true) {
+      return undefined;
+    }
+    const usedGrammar =
+      "response_format" in request &&
+      (request.response_format?.type === "grammar" ||
+        request.response_format?.type === "json_object");
+    const completionTokens =
+      pipeline.getCurRoundDecodingTotalTokens() + completionTokenOffset;
+    const promptTokens = pipeline.getCurRoundPrefillTotalTokens();
+    const prefillTime = pipeline.getCurRoundPrefillTotalTime();
+    const decodeTime = pipeline.getCurRoundDecodingTotalTime();
+    const defaultExtra = {
+      e2e_latency_s: (Date.now() - timeReceived) / 1000,
+      prefill_tokens_per_s: pipeline.getCurRoundPrefillTokensPerSec(),
+      decode_tokens_per_s: pipeline.getCurRoundDecodingTokensPerSec(),
+      time_to_first_token_s: prefillTime,
+      time_per_output_token_s: decodeTime / completionTokens,
+      latencyBreakdown: request.extra_body?.enable_latency_breakdown
+        ? pipeline.getCurRoundLatencyBreakdown()
+        : undefined,
+    };
+    const usage: CompletionUsage = {
+      completion_tokens: completionTokens,
+      prompt_tokens: promptTokens,
+      total_tokens: completionTokens + promptTokens,
+      extra: usedGrammar
+        ? {
+            ...defaultExtra,
+            grammar_init_s: pipeline.getCurRoundGrammarInitTotalTime(),
+            grammar_per_token_s:
+              pipeline.getCurRoundGrammarPerTokenTotalTime() / completionTokens,
+          }
+        : defaultExtra,
+    };
+
+    if ("messages" in request) {
+      return {
+        id: state.id,
+        choices: [],
+        usage,
+        model,
+        object: "chat.completion.chunk",
+        created: state.created,
+      };
+    }
+    return {
+      id: state.id,
+      choices: [],
+      usage,
+      model,
+      object: "text_completion",
+      created: state.created,
+    };
+  }
+
+  private async *streamCurrentGeneration(
+    request: ChatCompletionRequestStreaming | CompletionCreateParamsStreaming,
+    model: string,
+    pipeline: LLMChatPipeline,
+    genConfig: GenerationConfig,
+    timeReceived: number,
+    state: StreamGenerationState,
+    decodeStep: () => Promise<void>,
+    opts: StreamContinuationOptions = {},
+  ): AsyncGenerator<ChatCompletionChunk | Completion, void, void> {
+    if (opts.emitCurrent === true) {
+      const chunk = this.makeStreamDeltaChunk(
+        request,
+        model,
+        pipeline,
+        state,
+        opts.skipEmptyDelta,
+      );
+      if (chunk !== undefined) {
+        yield chunk;
+      }
+    }
+
+    while (!pipeline.stopped()) {
+      if (this.interruptSignal) {
+        pipeline.triggerStop();
+        break;
+      }
+      await decodeStep();
+      const chunk = this.makeStreamDeltaChunk(
+        request,
+        model,
+        pipeline,
+        state,
+        opts.skipEmptyDelta,
+      );
+      if (chunk !== undefined) {
+        yield chunk;
+      }
+    }
+
+    if (request.seed !== null && request.seed !== undefined) {
+      pipeline.setSeed(Date.now());
+    }
+    await opts.beforeFinalChunk?.();
+    yield this.makeStreamFinalChunk(request, model, pipeline, state);
+
+    const usageChunk = this.makeStreamUsageChunk(
+      request,
+      model,
+      pipeline,
+      state,
+      opts.completionTokenOffset ?? 0,
+      timeReceived,
+    );
+    if (usageChunk !== undefined) {
+      yield usageChunk;
+    }
+  }
+
   /**
    * Similar to `_generate()`; but instead of using callback, we use an async iterable.
    */
@@ -488,6 +1675,7 @@ export class MLCEngine implements MLCEngineInterface {
     chatConfig: ChatConfig,
     genConfig: GenerationConfig,
     timeReceived: number,
+    journal?: ResumableGenerationJournal,
   ): AsyncGenerator<ChatCompletionChunk, void, void>;
   asyncGenerate(
     request: CompletionCreateParamsStreaming,
@@ -496,6 +1684,7 @@ export class MLCEngine implements MLCEngineInterface {
     chatConfig: ChatConfig,
     genConfig: GenerationConfig,
     timeReceived: number,
+    journal?: ResumableGenerationJournal,
   ): AsyncGenerator<Completion, void, void>;
   async *asyncGenerate(
     request: ChatCompletionRequestStreaming | CompletionCreateParamsStreaming,
@@ -504,18 +1693,31 @@ export class MLCEngine implements MLCEngineInterface {
     chatConfig: ChatConfig,
     genConfig: GenerationConfig,
     timeReceived: number,
+    journal?: ResumableGenerationJournal,
   ): AsyncGenerator<ChatCompletionChunk | Completion, void, void> {
     // Since it is an async generator, we need to do fine-grained try-catch to ensure lock is
     // released only when errors occur. Then release at the very end when no error occurs.
     // TODO: This makes code less readable, is there a better way to do this?
     const lock = this.loadedModelIdToLock.get(model)!;
+    if (journal !== undefined) {
+      this.resetResumableMetrics();
+    }
 
-    // 0. Pre-processing
     const isChatCompletion = "messages" in request;
     const isFunctionCalling =
       "tools" in request &&
       request.tools !== undefined &&
       request.tools !== null;
+    let journalStarted = false;
+    let journalClosed = false;
+
+    const recordErrorCloseAndRelease = async (err: unknown) => {
+      if (journalStarted && !isResumableInjectedFault(err)) {
+        await journal?.recordEngineError({ err }).catch(() => undefined);
+      }
+      await journal?.close().catch(() => undefined);
+      await lock.release();
+    };
     try {
       if (isFunctionCalling && !isChatCompletion) {
         throw new Error(
@@ -527,244 +1729,137 @@ export class MLCEngine implements MLCEngineInterface {
         pipeline.setSeed(request.seed);
       }
     } catch (err) {
-      await lock.release();
+      await recordErrorCloseAndRelease(err);
       throw err;
     }
 
-    // 1. Helper function that generates the chunk
-    const created = getUnixTimestampSeconds();
-    const id = crypto.randomUUID();
+    const streamState: StreamGenerationState = {
+      id: crypto.randomUUID(),
+      created: getUnixTimestampSeconds(),
+      prevMessageLength: 0,
+    };
     this.interruptSignal = false;
-    let prevMessageLength = 0; // to know where to start slicing the delta; does not count �
 
-    function _countTrailingReplacementChar(curMessage: string): number {
-      let cntr = 0;
-      for (let i = curMessage.length - 1; i >= 0; i--) {
-        if (curMessage.charAt(i) === "�") {
-          cntr += 1;
-        } else {
-          return cntr;
+    let checkpointScheduler: DecodeCheckpointScheduler | undefined;
+    let resumablePromptSeqLen = 0;
+    try {
+      if (journal === undefined) {
+        await this.prefill(request, pipeline, chatConfig, genConfig);
+      } else {
+        const prefillStep = await this.samplePrefill(
+          request,
+          pipeline,
+          chatConfig,
+          genConfig,
+          {
+            capturePromptCheckpoint:
+              journal.checkpointPrompt && (await hasKVCheckpointQuota()),
+            storeCheckpointLogits: journal.storeCheckpointLogits,
+          },
+        );
+        if (prefillStep.promptTokenIds === undefined) {
+          throw new Error(
+            "Resumable generation currently supports text-only prompts.",
+          );
         }
-      }
-      return cntr;
-    }
-
-    async function _getChunk(
-      selectedPipeline: LLMChatPipeline,
-    ): Promise<ChatCompletionChunk | Completion | undefined> {
-      // Remove the replacement character (U+FFFD) from the response to handle emojis.
-      // Each emoji is made up of multiples of 4 tokens; when truncated, it is displayed as �, so
-      // we skip this delta until a full emoji is rendered
-      // TODO(Charlie): This does not consider cases of � not being emoji, need to fix with Streamer
-      const curMessage = selectedPipeline.getMessage();
-      const numTrailingReplacementChar =
-        _countTrailingReplacementChar(curMessage);
-      if (numTrailingReplacementChar % 4 !== 0) {
-        return undefined;
-      }
-
-      const deltaMessage = curMessage.slice(prevMessageLength);
-      prevMessageLength = curMessage.length;
-      const logprobs = request.logprobs
-        ? ({
-            content: selectedPipeline.getTokenLogprobArray().slice(-1), // always the last entry
-          } as ChatCompletionChunk.Choice.Logprobs)
-        : null;
-      if (isChatCompletion) {
-        const chunk: ChatCompletionChunk = {
-          id: id,
-          choices: [
-            {
-              delta: { content: deltaMessage, role: "assistant" },
-              finish_reason: null, // not finished yet
-              index: 0,
-              logprobs: logprobs,
-            },
-          ],
-          model: model,
-          object: "chat.completion.chunk",
-          created: created,
+        await journal.begin({
+          modelId: model,
+          request,
+          promptTokenIds: prefillStep.promptTokenIds,
+          assistantPrefixTokenIds: prefillStep.assistantPrefixTokenIds ?? [],
+          generationConfig: genConfig,
+        });
+        journalStarted = true;
+        resumablePromptSeqLen = prefillStep.globalTokenPos;
+        checkpointScheduler = {
+          intervalTokens: journal.checkpointIntervalTokens,
+          lastCheckpointSeqLen: prefillStep.globalTokenPos,
         };
-        return chunk;
-      } else {
-        const chunk: Completion = {
-          id: id,
-          choices: [
-            {
-              text: deltaMessage,
-              finish_reason: null, // not finished yet
-              index: 0,
-              logprobs: logprobs,
-            },
-          ],
-          model: model,
-          object: "text_completion",
-          created: created,
-        };
-        return chunk;
-      }
-    }
-
-    // 2. Auto-regressive loop
-    let curChunk;
-    try {
-      await this.prefill(request, pipeline, chatConfig, genConfig);
-      curChunk = await _getChunk(pipeline); // prefill produces a chunk
-    } catch (err) {
-      await lock.release();
-      throw err;
-    }
-    if (curChunk) {
-      yield curChunk;
-    }
-
-    while (!pipeline.stopped()) {
-      if (this.interruptSignal) {
-        // TODO: should we directly release lock here and return the async
-        // generator? Though no issue observed as of now with interruptGenerate()
-        pipeline.triggerStop();
-        break;
-      }
-      try {
-        await this.decode(pipeline, genConfig);
-        curChunk = await _getChunk(pipeline);
-      } catch (err) {
-        await lock.release();
-        throw err;
-      }
-      if (curChunk) {
-        yield curChunk;
-      }
-    }
-
-    // Reset seed -- we do not want this seed to affect future requests
-    if (request.seed !== null && request.seed !== undefined) {
-      pipeline.setSeed(Date.now());
-    }
-
-    // 3. Last chunk empty marking the end
-    // If function calling, use the last chunk to return tool_calls
-    let finish_reason = pipeline.getFinishReason()!;
-    let tool_calls:
-      | Array<ChatCompletionChunk.Choice.Delta.ToolCall>
-      | undefined;
-    try {
-      if (pipeline.getFinishReason() === "stop" && isFunctionCalling) {
-        // If stopped due to length or abort, cannot output return tool_calls field
-        finish_reason = "tool_calls";
-        const outputMessage = pipeline.getMessage();
-        tool_calls = getToolCallFromOutputMessage(
-          outputMessage,
-          /*isStreaming=*/ true,
-        ) as Array<ChatCompletionChunk.Choice.Delta.ToolCall>;
+        if (await this.writePromptCheckpoint(journal, prefillStep)) {
+          noteCommittedCheckpoint(
+            checkpointScheduler,
+            prefillStep.promptCheckpoint!,
+          );
+        }
+        const committedPrefill = pipeline.commitSampledStep(
+          prefillStep,
+          genConfig,
+        );
+        await this.recordGeneratedToken(
+          journal,
+          pipeline,
+          prefillStep,
+          committedPrefill,
+        );
       }
     } catch (err) {
-      await lock.release();
+      await recordErrorCloseAndRelease(err);
       throw err;
     }
-
-    if (isChatCompletion) {
-      const lastChunk: ChatCompletionChunk = {
-        id: id,
-        choices: [
-          {
-            delta: isFunctionCalling
-              ? {
-                  role: "assistant",
-                  tool_calls: tool_calls,
-                }
-              : {},
-            finish_reason: finish_reason,
-            index: 0,
-          },
-        ],
-        model: model,
-        object: "chat.completion.chunk",
-        created: created,
-      };
-      yield lastChunk;
-    } else {
-      const lastChunk: Completion = {
-        id: id,
-        choices: [
-          {
-            text: "",
-            finish_reason: finish_reason,
-            index: 0,
-          },
-        ],
-        model: model,
-        object: "text_completion",
-        created: created,
-      };
-      yield lastChunk;
-    }
-
-    // 4. Usage chunk
-    if (request.stream_options?.include_usage) {
-      const usedGrammar =
-        "response_format" in request &&
-        (request.response_format?.type === "grammar" ||
-          request.response_format?.type === "json_object");
-      const completion_tokens = pipeline.getCurRoundDecodingTotalTokens();
-      const prompt_tokens = pipeline.getCurRoundPrefillTotalTokens();
-      const prefill_tokens_per_s = pipeline.getCurRoundPrefillTokensPerSec();
-      const decode_tokens_per_s = pipeline.getCurRoundDecodingTokensPerSec();
-      const grammar_init_s = pipeline.getCurRoundGrammarInitTotalTime();
-      const prefill_time = pipeline.getCurRoundPrefillTotalTime();
-      const decode_time = pipeline.getCurRoundDecodingTotalTime();
-      const grammar_per_token_s =
-        pipeline.getCurRoundGrammarPerTokenTotalTime();
-      const latencyBreakdown: LatencyBreakdown =
-        pipeline.getCurRoundLatencyBreakdown();
-
-      const defaultExtra = {
-        e2e_latency_s: (Date.now() - timeReceived) / 1000,
-        prefill_tokens_per_s: prefill_tokens_per_s,
-        decode_tokens_per_s: decode_tokens_per_s,
-        time_to_first_token_s: prefill_time,
-        time_per_output_token_s: decode_time / completion_tokens,
-        latencyBreakdown: request.extra_body?.enable_latency_breakdown
-          ? latencyBreakdown
-          : undefined,
-      };
-      const usage: CompletionUsage = {
-        completion_tokens: completion_tokens,
-        prompt_tokens: prompt_tokens,
-        total_tokens: completion_tokens + prompt_tokens,
-        extra: usedGrammar
-          ? {
-              ...defaultExtra,
-              ...{
-                grammar_init_s: grammar_init_s,
-                grammar_per_token_s: grammar_per_token_s / completion_tokens,
-              },
+    try {
+      yield* this.streamCurrentGeneration(
+        request,
+        model,
+        pipeline,
+        genConfig,
+        timeReceived,
+        streamState,
+        async () => {
+          if (journal === undefined) {
+            await this.decode(pipeline, genConfig);
+            return;
+          }
+          const captureDecodeCheckpoint =
+            shouldCaptureDecodeCheckpoint(
+              checkpointScheduler!,
+              resumablePromptSeqLen + journal.emittedTokenCount,
+            ) && (await hasKVCheckpointQuota());
+          const decodeStep = await this.sampleDecode(pipeline, genConfig, {
+            captureCheckpoint: captureDecodeCheckpoint,
+            storeCheckpointLogits: journal.storeCheckpointLogits,
+          });
+          const committedDecode = pipeline.commitSampledStep(
+            decodeStep,
+            genConfig,
+          );
+          await this.recordGeneratedToken(
+            journal,
+            pipeline,
+            decodeStep,
+            committedDecode,
+          );
+          await this.writeDecodeCheckpoint(
+            journal,
+            checkpointScheduler!,
+            decodeStep,
+          );
+        },
+        {
+          emitCurrent: true,
+          beforeFinalChunk: async () => {
+            if (journal === undefined) {
+              return;
             }
-          : defaultExtra,
-      };
-      if (isChatCompletion) {
-        const usageChunk: ChatCompletionChunk = {
-          id: id,
-          choices: [],
-          usage: usage,
-          model: model,
-          object: "chat.completion.chunk",
-          created: created,
-        };
-        yield usageChunk;
-      } else {
-        const usageChunk: Completion = {
-          id: id,
-          choices: [],
-          usage: usage,
-          model: model,
-          object: "text_completion",
-          created: created,
-        };
-        yield usageChunk;
-      }
+            await journal.recordGenerationEnd({
+              finishReason: pipeline.getFinishReason(),
+              emittedTokens: journal.emittedTokenCount,
+            });
+            if (pipeline.getFinishReason() !== "abort") {
+              await this.cleanupKVAfterFinish(journal);
+            }
+            await journal.close();
+            journalClosed = true;
+          },
+        },
+      );
+    } catch (err) {
+      await recordErrorCloseAndRelease(err);
+      throw err;
     }
 
+    if (!journalClosed) {
+      await journal?.close().catch(() => undefined);
+    }
     await lock.release();
   }
 
@@ -823,6 +1918,8 @@ export class MLCEngine implements MLCEngineInterface {
       enable_thinking: request.extra_body?.enable_thinking,
       enable_latency_breakdown: request.extra_body?.enable_latency_breakdown,
     };
+    const resumableConfig = this.normalizeResumableForRequest(request);
+    const resumableJournal = this.tryCreateResumableJournal(resumableConfig);
 
     // 0.5 Block wait until this pipeline finishes all previous requests
     const lock = this.loadedModelIdToLock.get(selectedModelId)!;
@@ -837,6 +1934,7 @@ export class MLCEngine implements MLCEngineInterface {
         selectedChatConfig,
         genConfig,
         timeReceived,
+        resumableJournal,
       );
     }
 
@@ -862,12 +1960,22 @@ export class MLCEngine implements MLCEngineInterface {
           selectedPipeline.triggerStop();
           outputMessage = "";
         } else {
-          outputMessage = await this._generate(
-            request,
-            selectedPipeline,
-            selectedChatConfig,
-            genConfig,
-          );
+          outputMessage =
+            resumableJournal === undefined
+              ? await this._generate(
+                  request,
+                  selectedPipeline,
+                  selectedChatConfig,
+                  genConfig,
+                )
+              : await this._generateResumable(
+                  request,
+                  selectedModelId,
+                  selectedPipeline,
+                  selectedChatConfig,
+                  genConfig,
+                  resumableJournal,
+                );
         }
         let finish_reason = selectedPipeline.getFinishReason()!;
 
@@ -985,6 +2093,7 @@ export class MLCEngine implements MLCEngineInterface {
     request: CompletionCreateParams,
   ): Promise<AsyncIterable<Completion> | Completion> {
     const timeReceived = Date.now();
+    API.rejectCompletionResumable(request);
 
     // 0. Check model loaded and preprocess inputs
     const [selectedModelId, selectedPipeline, selectedChatConfig] =
@@ -1002,6 +2111,7 @@ export class MLCEngine implements MLCEngineInterface {
       logprobs: request.logprobs,
       top_logprobs: request.top_logprobs,
       ignore_eos: request.ignore_eos,
+      enable_latency_breakdown: request.extra_body?.enable_latency_breakdown,
     };
 
     // 0.5 Block wait until this pipeline finishes all previous requests
@@ -1146,6 +2256,216 @@ export class MLCEngine implements MLCEngineInterface {
       };
     } finally {
       await lock.release();
+    }
+  }
+
+  async listResumableSessions(): Promise<ResumeProbeResult[]> {
+    try {
+      const files = this.getResumableFileStore();
+      const sessions = this.getResumableSessionStore();
+      const results: ResumeProbeResult[] = [];
+      for (const session of await sessions.listSessions()) {
+        let result = await probeResumableSession(files, session);
+        if (
+          result.resumable &&
+          result.recoveryMode === "token_replay" &&
+          (await sessions.listCommittedCheckpoints(session.sessionId)).length >
+            0
+        ) {
+          result = { ...result, recoveryMode: "kv" };
+        }
+        if (
+          result.resumable &&
+          (result.recoveryMode === "token_replay" ||
+            result.recoveryMode === "kv") &&
+          this.logitProcessorRegistry?.has(result.modelId)
+        ) {
+          results.push({
+            ...result,
+            resumable: false,
+            reason: "custom LogitProcessor replay unsupported",
+            recoveryMode: result.emittedTokens > 0 ? "text_only" : "none",
+          });
+        } else {
+          results.push(result);
+        }
+      }
+      return results;
+    } catch {
+      return [];
+    }
+  }
+
+  async resumeChatCompletion(
+    sessionId: string,
+    options?: ResumeChatCompletionOptions,
+  ): Promise<ResumeResult | AsyncIterable<ChatCompletionChunk>> {
+    const files = this.getResumableFileStore();
+    const sessions = this.getResumableSessionStore();
+    const session = await sessions.openSession(sessionId);
+    if (session === undefined) {
+      throw new Error(`Resumable session not found: ${sessionId}`);
+    }
+    if (options?.continueGeneration !== true) {
+      const replayState = await readResumableReplayState(files, session);
+      return this.makeTextOnlyResumeResult(replayState);
+    }
+
+    const releaseSessionLock = await files.tryLock(session.paths.lockPath);
+    if (releaseSessionLock === undefined) {
+      throw new Error(`Resumable session is already active: ${sessionId}`);
+    }
+    let releaseSessionLockOnExit = true;
+    try {
+      this.resetResumableMetrics();
+      const replayState = await readResumableReplayState(files, session);
+      if (replayState.resumableConfig === undefined) {
+        throw new Error(
+          `Resumable session ${sessionId} is missing or has malformed resumable generation config.`,
+        );
+      }
+
+      let selectedModelId: string;
+      let selectedPipeline: LLMChatPipeline;
+      let selectedChatConfig: ChatConfig;
+      try {
+        [selectedModelId, selectedPipeline, selectedChatConfig] =
+          this.getLLMStates("resumeChatCompletion", replayState.modelId);
+      } catch (err) {
+        if (
+          err instanceof ModelNotLoadedError ||
+          err instanceof SpecifiedModelNotFoundError
+        ) {
+          return this.makeTextOnlyResumeResult(replayState);
+        }
+        throw err;
+      }
+      if (selectedModelId !== replayState.modelId) {
+        return this.makeTextOnlyResumeResult(replayState);
+      }
+
+      const lock = this.loadedModelIdToLock.get(selectedModelId)!;
+      await lock.acquire();
+      let releaseModelLock = true;
+      try {
+        if (replayState.generationConfig === undefined) {
+          return this.makeTextOnlyResumeResult(replayState);
+        }
+        const genConfig = replayState.generationConfig;
+        postInitAndCheckGenerationConfigValues(genConfig);
+        let restored = await this.tryRestoreKVResumeState(
+          files,
+          sessions,
+          session,
+          replayState,
+          selectedPipeline,
+          genConfig,
+        );
+        if (restored === undefined) {
+          const blockReason = this.getTokenReplayBlockReason(replayState);
+          if (blockReason !== undefined) {
+            log.warn(
+              `Resumable session ${sessionId} recovered as text-only: ${blockReason}.`,
+            );
+            return this.makeTextOnlyResumeResult(replayState);
+          }
+          const replayStart = performance.now();
+          try {
+            await selectedPipeline.replayGenerationTokens(
+              replayState.promptTokenIds,
+              replayState.assistantPrefixTokenIds,
+              replayState.generatedTokens,
+              genConfig,
+            );
+          } finally {
+            this.resumableMetrics().tokenReplayMs +=
+              performance.now() - replayStart;
+          }
+          const rngState =
+            replayState.generatedTokens[replayState.generatedTokens.length - 1]
+              .rngState;
+          if (!selectedPipeline.setRNGState(rngState)) {
+            selectedPipeline.resetChat();
+            return this.makeTextOnlyResumeResult(replayState);
+          }
+          restored = {
+            recoveryMode: "token_replay",
+            replayedTokens: replayState.emittedTokens,
+            extraEmittedTokens: 0,
+            firstTokenRecorded: false,
+            lastCheckpointSeqLen: replayPromptSeqLen(replayState),
+          };
+        }
+
+        const resumeJournal = await this.createResumeContinuationJournal(
+          files,
+          sessions,
+          session,
+          replayState,
+        );
+        const checkpointScheduler = this.createResumeCheckpointScheduler(
+          resumeJournal,
+          restored,
+        );
+        const promptSeqLen = replayPromptSeqLen(replayState);
+
+        if (
+          options?.stream === true &&
+          isChatCompletionReplayRequest(replayState.request) &&
+          replayState.request.stream === true
+        ) {
+          releaseModelLock = false;
+          releaseSessionLockOnExit = false;
+          return this.streamResumeContinuation(
+            replayState.request,
+            selectedModelId,
+            selectedPipeline,
+            selectedChatConfig,
+            genConfig,
+            replayState,
+            restored,
+            resumeJournal,
+            checkpointScheduler,
+            promptSeqLen,
+            async () => {
+              try {
+                await lock.release();
+              } finally {
+                releaseSessionLock();
+              }
+            },
+          );
+        }
+
+        return await this.finishResumeContinuation(
+          replayState,
+          selectedPipeline,
+          selectedChatConfig,
+          genConfig,
+          restored,
+          resumeJournal,
+          checkpointScheduler,
+          promptSeqLen,
+        );
+      } finally {
+        if (releaseModelLock) {
+          await lock.release();
+        }
+      }
+    } finally {
+      if (releaseSessionLockOnExit) {
+        releaseSessionLock();
+      }
+    }
+  }
+
+  async deleteResumableSession(sessionId: string): Promise<void> {
+    try {
+      await this.getResumableSessionStore().deleteSession(sessionId);
+    } catch (err) {
+      if (!isOPFSUnavailableError(err)) {
+        throw err;
+      }
     }
   }
 
@@ -1363,18 +2683,21 @@ export class MLCEngine implements MLCEngineInterface {
    * @param chatConfig The chat config to use for this model.
    * @param genConfig Generation config.
    */
-  async prefill(
+  private preparePrefillInput(
     input: ChatCompletionRequest | CompletionCreateParams,
     pipeline: LLMChatPipeline,
     chatConfig: ChatConfig,
-    genConfig: GenerationConfig,
-  ) {
+  ): {
+    inputStr: string;
+    lastMsgRole: Role;
+    inputRoleStr?: string;
+  } {
     // TODO: SPECIFY MODEL TO PERFORM PREFILL, HENCE RETRIEVE CONFIG
     if (chatConfig === undefined) {
       throw new ConfigurationNotInitializedError();
     }
-    let input_str: string;
-    let input_role_str: string | undefined;
+    let inputStr: string;
+    let inputRoleStr: string | undefined;
     let lastMsgRole = Role.user;
     if ("messages" in input) {
       // For ChatCompletionRequest, we prepare input using `messages`
@@ -1400,13 +2723,13 @@ export class MLCEngine implements MLCEngineInterface {
       const last_msg = input.messages[
         input.messages.length - 1
       ] as ChatCompletionMessageParam;
-      input_str = last_msg.content as string;
-      input_role_str =
+      inputStr = last_msg.content as string;
+      inputRoleStr =
         last_msg.role === "user" && last_msg.name ? last_msg.name : undefined;
       lastMsgRole = last_msg.role === "tool" ? Role.tool : Role.user;
     } else {
       // For CompletionCreateParams, the input is just the prompt
-      input_str = input.prompt;
+      inputStr = input.prompt;
       pipeline.resetChat();
       const newConv = getConversation(
         chatConfig.conv_template,
@@ -1415,11 +2738,41 @@ export class MLCEngine implements MLCEngineInterface {
       );
       pipeline.setConversation(newConv);
     }
-    return pipeline.prefillStep(
-      input_str,
+    return { inputStr, lastMsgRole, inputRoleStr };
+  }
+
+  async prefill(
+    input: ChatCompletionRequest | CompletionCreateParams,
+    pipeline: LLMChatPipeline,
+    chatConfig: ChatConfig,
+    genConfig: GenerationConfig,
+  ) {
+    const { inputStr, lastMsgRole, inputRoleStr } = this.preparePrefillInput(
+      input,
+      pipeline,
+      chatConfig,
+    );
+    return pipeline.prefillStep(inputStr, lastMsgRole, inputRoleStr, genConfig);
+  }
+
+  async samplePrefill(
+    input: ChatCompletionRequest | CompletionCreateParams,
+    pipeline: LLMChatPipeline,
+    chatConfig: ChatConfig,
+    genConfig: GenerationConfig,
+    opts?: SamplePrefillOptions,
+  ): Promise<SampledGenerationStep> {
+    const { inputStr, lastMsgRole, inputRoleStr } = this.preparePrefillInput(
+      input,
+      pipeline,
+      chatConfig,
+    );
+    return pipeline.samplePrefillStep(
+      inputStr,
       lastMsgRole,
-      input_role_str,
+      inputRoleStr,
       genConfig,
+      opts,
     );
   }
 
@@ -1428,5 +2781,13 @@ export class MLCEngine implements MLCEngineInterface {
    */
   async decode(pipeline: LLMChatPipeline, genConfig?: GenerationConfig) {
     return pipeline.decodeStep(genConfig);
+  }
+
+  async sampleDecode(
+    pipeline: LLMChatPipeline,
+    genConfig?: GenerationConfig,
+    opts?: SampleDecodeOptions,
+  ): Promise<SampledGenerationStep> {
+    return pipeline.sampleDecodeStep(genConfig, opts);
   }
 }

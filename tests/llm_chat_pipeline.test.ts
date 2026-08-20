@@ -30,7 +30,12 @@ jest.mock("@mlc-ai/web-xgrammar", () => {
     },
     GrammarMatcher: {
       createGrammarMatcher: jest.fn(async () => {
-        const matcher = { dispose: jest.fn(), reset: jest.fn() };
+        const matcher = {
+          acceptToken: jest.fn(() => true),
+          dispose: jest.fn(),
+          getNextTokenBitmask: jest.fn(async () => new Int32Array()),
+          reset: jest.fn(),
+        };
         grammarMatcherInstances.push(matcher);
         return matcher;
       }),
@@ -116,6 +121,7 @@ function createPipeline(): PipelineLike {
     endScope: jest.fn(),
     detachFromCurrentScope: jest.fn((x: any) => x),
   } as any;
+  pipeline["kvCheckpointFuncs"] = new Map();
   pipeline["device"] = {
     sync: jest.fn(async () => undefined),
   } as any;
@@ -131,11 +137,13 @@ function createPipeline(): PipelineLike {
       };
     },
   ) as any;
-  pipeline["sampleTokenFromLogits"] = jest.fn(async () => 2);
+  pipeline["sampleFromRawLogits"] = jest.fn(async () => 2);
   pipeline["resetRuntimeStats"] = jest.fn();
   pipeline["resetStatsPerPrefill"] = false;
   pipeline["prefillTotalTime"] = 0;
   pipeline["prefillTotalTokens"] = 0;
+  pipeline["decodingTotalTime"] = 0;
+  pipeline["decodingTotalTokens"] = 0;
   pipeline["curRoundPrefillTotalTokens"] = 0;
   pipeline["curRoundPrefillTotalTime"] = 0;
   pipeline["curRoundGrammarInitTotalTime"] = 0;
@@ -236,9 +244,128 @@ test("prefillStep appends standard reply header when thinking enabled", async ()
   ).not.toHaveBeenCalled();
 });
 
+test("forwardPrefill returns raw logits and assistant prefix metadata", async () => {
+  const pipeline = preparePrefillPipeline();
+  const rawLogits = {
+    dispose: jest.fn(),
+    shape: [],
+    dtype: "float32",
+    device: {},
+    ndim: 0,
+  } as any;
+  pipeline["tokenizer"].encode = jest.fn(() => Int32Array.from([9, 9]));
+  pipeline["embedAndForward"] = jest.fn(
+    async (_chunk: any, chunkLen: number) => {
+      pipeline["filledKVCacheLength"] += chunkLen;
+      return rawLogits;
+    },
+  ) as any;
+
+  const result = await pipeline["forwardPrefill"](
+    "hello",
+    Role.user,
+    undefined,
+    {
+      enable_thinking: false,
+    },
+  );
+
+  expect(result.logits).toBe(rawLogits);
+  expect(result.promptLen).toBe(1);
+  expect(result.assistantPrefixTokenIds).toEqual([9, 9]);
+  expect(pipeline["sampleFromRawLogits"]).not.toHaveBeenCalled();
+  expect(
+    pipeline["conversation"].appendEmptyThinkingReplyHeader,
+  ).toHaveBeenCalled();
+});
+
+test("prefillStep samples raw prefill logits before committing token", async () => {
+  const pipeline = preparePrefillPipeline();
+  const rawLogits = {
+    dispose: jest.fn(),
+    shape: [],
+    dtype: "float32",
+    device: {},
+    ndim: 0,
+  } as any;
+  const genConfig = { max_tokens: 5 };
+  pipeline["embedAndForward"] = jest.fn(
+    async (_chunk: any, chunkLen: number) => {
+      pipeline["filledKVCacheLength"] += chunkLen;
+      return rawLogits;
+    },
+  ) as any;
+  pipeline["sampleFromRawLogits"] = jest.fn(async () => 4);
+
+  await pipeline.prefillStep("hello", Role.user, undefined, genConfig);
+
+  expect(pipeline["sampleFromRawLogits"]).toHaveBeenCalledWith(
+    rawLogits,
+    genConfig,
+  );
+  expect(rawLogits.dispose).toHaveBeenCalled();
+  expect(pipeline["processNextToken"]).toHaveBeenCalledWith(4, genConfig);
+});
+
+test("decodeStep forwards last committed token and commits sampled token", async () => {
+  const pipeline = createPipeline();
+  const rawLogits = {
+    dispose: jest.fn(),
+    shape: [],
+    dtype: "float32",
+    device: {},
+    ndim: 0,
+  } as any;
+  const genConfig = { max_tokens: 5 };
+  pipeline["outputIds"] = [7];
+  pipeline["processNextToken"] = jest.fn();
+  pipeline["embedAndForward"] = jest.fn(
+    async (_chunk: any, chunkLen: number) => {
+      pipeline["filledKVCacheLength"] += chunkLen;
+      return rawLogits;
+    },
+  ) as any;
+  pipeline["sampleFromRawLogits"] = jest.fn(async () => 8);
+
+  await pipeline.decodeStep(genConfig);
+
+  expect(pipeline["embedAndForward"]).toHaveBeenCalledWith([[7]], 1);
+  expect(pipeline["sampleFromRawLogits"]).toHaveBeenCalledWith(
+    rawLogits,
+    genConfig,
+  );
+  expect(rawLogits.dispose).toHaveBeenCalled();
+  expect(pipeline["processNextToken"]).toHaveBeenCalledWith(8, genConfig);
+  expect(pipeline["curRoundDecodingTotalTokens"]).toBe(1);
+});
+
+test("getKVCheckpointFunc uses a scope and caches packed functions", () => {
+  const pipeline = createPipeline();
+  const func = jest.fn() as any;
+  func.dispose = jest.fn();
+  pipeline["tvm"].getGlobalFunc = jest.fn((name: string) => {
+    expect(name).toBe("vm.builtin.attention_kv_cache_get_checkpoint_metadata");
+    return func;
+  });
+
+  const first = pipeline["getKVCheckpointFunc"](
+    "vm.builtin.attention_kv_cache_get_checkpoint_metadata",
+  );
+  const second = pipeline["getKVCheckpointFunc"](
+    "vm.builtin.attention_kv_cache_get_checkpoint_metadata",
+  );
+
+  expect(first).toBe(func);
+  expect(second).toBe(func);
+  expect(pipeline["tvm"].beginScope).toHaveBeenCalledTimes(1);
+  expect(pipeline["tvm"].detachFromCurrentScope).toHaveBeenCalledWith(func);
+  expect(pipeline["tvm"].endScope).toHaveBeenCalledTimes(1);
+  expect(pipeline["tvm"].getGlobalFunc).toHaveBeenCalledTimes(1);
+});
+
 test("prefillStep reuses grammar matcher when schema unchanged", async () => {
   const pipeline = preparePrefillPipeline();
-  const matcher = { reset: jest.fn(), dispose: jest.fn() };
+  const matcher = { acceptToken: jest.fn(() => true), reset: jest.fn() };
   pipeline["grammarMatcher"] = matcher as any;
   pipeline["responseFormatCacheKey"] = "schema_v1";
   await pipeline.prefillStep("hello", Role.user, undefined, {

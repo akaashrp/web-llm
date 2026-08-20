@@ -5,6 +5,8 @@ import {
   InitProgressReport,
   LogLevel,
   LogitProcessor,
+  ResumeProbeResult,
+  ResumeResult,
 } from "./types";
 import {
   ChatCompletionRequest,
@@ -37,6 +39,8 @@ import {
   GetMessageParams,
   RuntimeStatsTextParams,
   CompletionStreamNextChunkParams,
+  ResumeChatCompletionParams,
+  DeleteResumableSessionParams,
 } from "./message";
 import log from "loglevel";
 import { MLCEngine } from "./engine";
@@ -46,6 +50,12 @@ import {
 } from "./error";
 import { areArraysEqual } from "./utils";
 import { getModelIdToUse } from "./support";
+
+function isAsyncIterable<T>(value: unknown): value is AsyncIterable<T> {
+  return (
+    typeof value === "object" && value !== null && Symbol.asyncIterator in value
+  );
+}
 
 /**
  * Worker handler that can be used in a WebWorker
@@ -259,6 +269,59 @@ export class WebWorkerMLCEngineHandler {
           const res = await this.engine.embedding(params.request);
           onComplete?.(res);
           return res;
+        });
+        return;
+      }
+      case "listResumableSessions": {
+        this.handleTask(msg.uuid, async () => {
+          const res = await this.engine.listResumableSessions();
+          onComplete?.(res);
+          return res;
+        });
+        return;
+      }
+      case "resumeChatCompletion": {
+        this.handleTask(msg.uuid, async () => {
+          const params = msg.content as ResumeChatCompletionParams;
+          const res = await this.engine.resumeChatCompletion(
+            params.sessionId,
+            params.options,
+          );
+          onComplete?.(res);
+          return res as ResumeResult;
+        });
+        return;
+      }
+      case "resumeChatCompletionStreamInit": {
+        this.handleTask(msg.uuid, async () => {
+          const params = msg.content as ResumeChatCompletionParams;
+          const res = await this.engine.resumeChatCompletion(
+            params.sessionId,
+            params.options,
+          );
+          if (isAsyncIterable<ChatCompletionChunk>(res)) {
+            this.loadedModelIdToAsyncGenerator.set(
+              params.sessionId,
+              res[Symbol.asyncIterator]() as AsyncGenerator<
+                ChatCompletionChunk | Completion,
+                void,
+                void
+              >,
+            );
+            onComplete?.(null);
+            return null;
+          }
+          onComplete?.(res);
+          return res;
+        });
+        return;
+      }
+      case "deleteResumableSession": {
+        this.handleTask(msg.uuid, async () => {
+          const params = msg.content as DeleteResumableSessionParams;
+          await this.engine.deleteResumableSession(params.sessionId);
+          onComplete?.(null);
+          return null;
         });
         return;
       }
@@ -799,6 +862,52 @@ export class WebWorkerMLCEngine implements MLCEngineInterface {
       },
     };
     return await this.getPromise<CreateEmbeddingResponse>(msg);
+  }
+
+  async listResumableSessions(): Promise<ResumeProbeResult[]> {
+    const msg: WorkerRequest = {
+      kind: "listResumableSessions",
+      uuid: crypto.randomUUID(),
+      content: null,
+    };
+    return await this.getPromise<ResumeProbeResult[]>(msg);
+  }
+
+  async resumeChatCompletion(
+    sessionId: string,
+    options?: { continueGeneration?: boolean; stream?: boolean },
+  ): Promise<ResumeResult | AsyncIterable<ChatCompletionChunk>> {
+    if (options?.continueGeneration === true && options.stream === true) {
+      const msg: WorkerRequest = {
+        kind: "resumeChatCompletionStreamInit",
+        uuid: crypto.randomUUID(),
+        content: { sessionId, options } as ResumeChatCompletionParams,
+      };
+      const result = await this.getPromise<ResumeResult | null>(msg);
+      if (result !== null) {
+        return result;
+      }
+      return this.asyncGenerate(sessionId) as AsyncGenerator<
+        ChatCompletionChunk,
+        void,
+        void
+      >;
+    }
+    const msg: WorkerRequest = {
+      kind: "resumeChatCompletion",
+      uuid: crypto.randomUUID(),
+      content: { sessionId, options } as ResumeChatCompletionParams,
+    };
+    return await this.getPromise<ResumeResult>(msg);
+  }
+
+  async deleteResumableSession(sessionId: string): Promise<void> {
+    const msg: WorkerRequest = {
+      kind: "deleteResumableSession",
+      uuid: crypto.randomUUID(),
+      content: { sessionId } as DeleteResumableSessionParams,
+    };
+    await this.getPromise<null>(msg);
   }
 
   onmessage(event: any) {

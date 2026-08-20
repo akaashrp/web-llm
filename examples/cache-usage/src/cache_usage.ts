@@ -16,6 +16,7 @@ async function main() {
   const appConfig = webllm.prebuiltAppConfig;
   // CHANGE THIS TO SEE THE EFFECTS OF EACH, CODE BELOW DOES NOT NEED TO CHANGE
   appConfig.cacheBackend = "cache"; // "indexeddb" or "cache" or "cross-origin" or "opfs"
+  appConfig.opfsAccessMode = "async"; // "sync" or "async" or "auto", only applies when cacheBackend is "opfs"
 
   const cacheBackend = appConfig.cacheBackend as string;
   if (cacheBackend === "indexeddb") {
@@ -29,7 +30,7 @@ async function main() {
   }
 
   // 1. This triggers downloading and caching the model with either Cache or IndexedDB Cache
-  const selectedModel = "Llama-3.2-1B-Instruct-q4f16_1-MLC";
+  const selectedModel = "Qwen3-0.6B-q4f16_1-MLC";
   const engine: webllm.MLCEngineInterface = await webllm.CreateMLCEngine(
     selectedModel,
     { initProgressCallback: initProgressCallback, appConfig: appConfig },

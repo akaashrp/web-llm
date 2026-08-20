@@ -171,10 +171,7 @@ async function main() {
   if (await testLogprobs(modelId, appConfig)) passed++;
   total++;
 
-  setLabel(
-    "gpu-test-label",
-    `GPU sampleTokenFromLogits tests: ${passed}/${total} passed.`,
-  );
+  setLabel("gpu-test-label", `GPU sampling tests: ${passed}/${total} passed.`);
   setLabel(
     "gpu-test-label",
     `Tests complete. Model deleted. ${passed}/${total} passed.`,

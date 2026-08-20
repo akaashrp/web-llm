@@ -30,6 +30,42 @@ export interface InitProgressReport {
  */
 export type InitProgressCallback = (report: InitProgressReport) => void;
 
+export interface ResumableGenerationConfig {
+  enabled: boolean;
+  sessionId?: string;
+  checkpointIntervalTokens?: number;
+  checkpointPrompt?: boolean;
+  durabilityMode?: "exact" | "relaxed";
+  strictPersistence?: boolean;
+  storeCheckpointLogits?: boolean;
+}
+
+export interface ResumeProbeResult {
+  sessionId: string;
+  resumable: boolean;
+  reason?: string;
+  modelId: string;
+  emittedTokens: number;
+  processedSeqLen: number;
+  recoveryMode: "kv" | "token_replay" | "text_only" | "none";
+}
+
+export type ResumableSessionInfo = ResumeProbeResult;
+
+export interface ResumeResult {
+  sessionId: string;
+  recoveredText: string;
+  emittedTokens: number;
+  processedSeqLen: number;
+  replayedTokens: number;
+  recoveryMode: "kv" | "token_replay" | "text_only";
+}
+
+export interface ResumeChatCompletionOptions {
+  continueGeneration?: boolean;
+  stream?: boolean;
+}
+
 /**
  * A stateful logitProcessor used to post-process logits after forwarding the input and before
  * sampling the next token. If used with `GenerationConfig.logit_bias`, logit_bias is applied after
@@ -171,6 +207,15 @@ export interface MLCEngineInterface {
    * @note For more, see https://platform.openai.com/docs/api-reference/embeddings/create
    */
   embedding(request: EmbeddingCreateParams): Promise<CreateEmbeddingResponse>;
+
+  listResumableSessions(): Promise<ResumeProbeResult[]>;
+
+  resumeChatCompletion(
+    sessionId: string,
+    options?: ResumeChatCompletionOptions,
+  ): Promise<ResumeResult | AsyncIterable<ChatCompletionChunk>>;
+
+  deleteResumableSession(sessionId: string): Promise<void>;
 
   /**
    * @returns A text summarizing the runtime stats.

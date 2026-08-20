@@ -12,6 +12,26 @@ import { MessagePlaceholders, ModelType } from "../src/config";
 import { describe, expect, test } from "@jest/globals";
 
 describe("Check chat completion unsupported requests", () => {
+  test("resumable extra_body is accepted", () => {
+    const request: ChatCompletionRequest = {
+      messages: [{ role: "user", content: "Hello! " }],
+      extra_body: {
+        resumable: {
+          enabled: true,
+          sessionId: "session-a",
+          durabilityMode: "exact",
+        },
+      },
+    };
+    expect(() =>
+      postInitAndCheckFields(
+        request,
+        "Llama-3.1-8B-Instruct-q4f32_1-MLC",
+        ModelType.LLM,
+      ),
+    ).not.toThrow();
+  });
+
   test("stream_options without stream specified", () => {
     expect(() => {
       const request: ChatCompletionRequest = {

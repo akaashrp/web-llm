@@ -13,41 +13,39 @@ async function main() {
     setLabel("init-label", report.text);
   };
   // Option 1: If we do not specify appConfig, we use `prebuiltAppConfig` defined in `config.ts`
-  const selectedModel = "Llama-3.1-8B-Instruct-q4f32_1-MLC";
-  const engine: webllm.MLCEngineInterface = await webllm.CreateMLCEngine(
-    selectedModel,
-    {
-      initProgressCallback: initProgressCallback,
-      logLevel: "INFO", // specify the log level
-    },
-    // customize kv cache, use either context_window_size or sliding_window_size (with attention sink)
-    {
-      context_window_size: 2048,
-      // sliding_window_size: 1024,
-      // attention_sink_size: 4,
-    },
-  );
-
-  // Option 2: Specify your own model other than the prebuilt ones
-  // const appConfig: webllm.AppConfig = {
-  //   model_list: [
-  //     {
-  //       model: "https://huggingface.co/mlc-ai/Llama-3.1-8B-Instruct-q4f32_1-MLC",
-  //       model_id: "Llama-3.1-8B-Instruct-q4f32_1-MLC",
-  //       model_lib:
-  //         webllm.modelLibURLPrefix +
-  //         webllm.modelVersion +
-  //         "/Llama-3_1-8B-Instruct-q4f32_1-ctx4k_cs1k-webgpu.wasm",
-  //       overrides: {
-  //         context_window_size: 2048,
-  //       },
-  //     },
-  //   ],
-  // };
+  const selectedModel = "Qwen3-0.6B-q4f16_1-MLC";
   // const engine: webllm.MLCEngineInterface = await webllm.CreateMLCEngine(
   //   selectedModel,
-  //   { appConfig: appConfig, initProgressCallback: initProgressCallback },
+  //   {
+  //     initProgressCallback: initProgressCallback,
+  //     logLevel: "INFO", // specify the log level
+  //   },
+  //   // customize kv cache, use either context_window_size or sliding_window_size (with attention sink)
+  //   {
+  //     context_window_size: 2048,
+  //     // sliding_window_size: 1024,
+  //     // attention_sink_size: 4,
+  //   },
   // );
+
+  // Option 2: Specify your own model other than the prebuilt ones
+  const appConfig: webllm.AppConfig = {
+    model_list: [
+      {
+        model: `https://huggingface.co/mlc-ai/${selectedModel}`,
+        model_id: selectedModel,
+        model_lib:
+          "https://raw.githubusercontent.com/akaashrp/mlc-binaries/main/resumable/Qwen3-0.6B-q4f16_1-webgpu-mlc-new-runtime.wasm",
+        overrides: {
+          context_window_size: 2048,
+        },
+      },
+    ],
+  };
+  const engine: webllm.MLCEngineInterface = await webllm.CreateMLCEngine(
+    selectedModel,
+    { appConfig: appConfig, initProgressCallback: initProgressCallback },
+  );
 
   // Option 3: Instantiate MLCEngine() and call reload() separately
   // const engine: webllm.MLCEngineInterface = new webllm.MLCEngine({
@@ -60,7 +58,7 @@ async function main() {
     messages: [{ role: "user", content: "List three US states." }],
     // below configurations are all optional
     n: 3,
-    temperature: 1.5,
+    temperature: 0,
     max_tokens: 256,
     // 46510 and 7188 are "California", and 8421 and 51325 are "Texas" in Llama-3.1-8B-Instruct
     // So we would have a higher chance of seeing the latter two, but never the first in the answer

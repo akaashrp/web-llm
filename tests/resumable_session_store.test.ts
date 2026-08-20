@@ -1,0 +1,242 @@
+import { OPFSFileStore } from "../src/resumable/opfs_file_store";
+import {
+  JournalRecordType,
+  appendJournalRecord,
+} from "../src/resumable/journal";
+import { ResumableSessionStore } from "../src/resumable/session_store";
+import { test, expect } from "@jest/globals";
+
+function normalize(path: string): string {
+  return path
+    .split("/")
+    .filter((part) => part !== "")
+    .join("/");
+}
+
+function parentDirs(path: string): string[] {
+  const parts = normalize(path).split("/");
+  parts.pop();
+  const dirs: string[] = [];
+  for (let i = 1; i <= parts.length; i++) {
+    dirs.push(parts.slice(0, i).join("/"));
+  }
+  return dirs;
+}
+
+function bytes(data: BufferSource): Uint8Array<ArrayBuffer> {
+  const view = ArrayBuffer.isView(data)
+    ? new Uint8Array(data.buffer, data.byteOffset, data.byteLength)
+    : new Uint8Array(data);
+  return new Uint8Array(view);
+}
+
+class MemoryFileStore implements OPFSFileStore {
+  private readonly files = new Map<string, Uint8Array<ArrayBuffer>>();
+  private readonly dirs = new Set<string>([""]);
+
+  async read(path: string): Promise<ArrayBuffer | undefined> {
+    const data = this.files.get(normalize(path));
+    return data === undefined ? undefined : new Uint8Array(data).buffer;
+  }
+
+  async write(path: string, data: BufferSource): Promise<void> {
+    const normalized = normalize(path);
+    for (const dir of parentDirs(normalized)) {
+      this.dirs.add(dir);
+    }
+    this.files.set(normalized, bytes(data));
+  }
+
+  async append(path: string, data: BufferSource): Promise<void> {
+    const normalized = normalize(path);
+    const prev = this.files.get(normalized) ?? new Uint8Array();
+    const next = new Uint8Array(prev.byteLength + bytes(data).byteLength);
+    next.set(prev);
+    next.set(bytes(data), prev.byteLength);
+    await this.write(normalized, next);
+  }
+
+  async remove(path: string, opts?: { recursive?: boolean }): Promise<void> {
+    const normalized = normalize(path);
+    if (this.files.delete(normalized)) {
+      return;
+    }
+    const prefix = `${normalized}/`;
+    const childFiles = [...this.files.keys()].filter((key) =>
+      key.startsWith(prefix),
+    );
+    const childDirs = [...this.dirs].filter((dir) => dir.startsWith(prefix));
+    if (!this.dirs.has(normalized) && childFiles.length === 0) {
+      return;
+    }
+    if (
+      opts?.recursive !== true &&
+      (childFiles.length > 0 || childDirs.length > 0)
+    ) {
+      throw new Error("Directory is not empty");
+    }
+    this.dirs.delete(normalized);
+    for (const key of childFiles) {
+      this.files.delete(key);
+    }
+    for (const dir of childDirs) {
+      this.dirs.delete(dir);
+    }
+  }
+
+  async list(path: string): Promise<string[]> {
+    const normalized = normalize(path);
+    const prefix = normalized === "" ? "" : `${normalized}/`;
+    if (normalized !== "" && !this.dirs.has(normalized)) {
+      return [];
+    }
+    const names = new Set<string>();
+    for (const key of [...this.dirs, ...this.files.keys()]) {
+      if (key === normalized || !key.startsWith(prefix)) {
+        continue;
+      }
+      names.add(key.slice(prefix.length).split("/")[0]);
+    }
+    return [...names].sort();
+  }
+
+  async mkdir(path: string): Promise<void> {
+    const normalized = normalize(path);
+    for (const dir of [...parentDirs(normalized), normalized]) {
+      this.dirs.add(dir);
+    }
+  }
+
+  async lock(): Promise<() => void> {
+    return () => undefined;
+  }
+
+  async tryLock(): Promise<() => void> {
+    return () => undefined;
+  }
+}
+
+const encoder = new TextEncoder();
+
+function makeStore(): {
+  files: MemoryFileStore;
+  sessions: ResumableSessionStore;
+} {
+  const files = new MemoryFileStore();
+  return {
+    files,
+    sessions: new ResumableSessionStore(files, {
+      rootPath: "resume-root",
+      now: () => 1000,
+    }),
+  };
+}
+
+test("session store creates, opens, and lists deterministic session dirs", async () => {
+  const { files, sessions } = makeStore();
+  const session = await sessions.createSession("session-a", {
+    modelId: "model-a",
+  });
+
+  expect(session.paths).toEqual({
+    sessionDir: "resume-root/sessions/session-a",
+    manifestPath: "resume-root/sessions/session-a/manifest.json",
+    journalPath: "resume-root/sessions/session-a/journal.bin",
+    lockPath: "resume-root/sessions/session-a/lock",
+    kvDir: "resume-root/sessions/session-a/kv",
+  });
+  expect(await files.list("resume-root/sessions")).toEqual(["session-a"]);
+  expect((await sessions.openSession("session-a"))?.manifest?.modelId).toBe(
+    "model-a",
+  );
+  expect((await sessions.listSessions()).map((item) => item.sessionId)).toEqual(
+    ["session-a"],
+  );
+  expect(await sessions.openSession("missing")).toBeUndefined();
+});
+
+test("deleteSession removes journal and kv directories", async () => {
+  const { files, sessions } = makeStore();
+  const session = await sessions.createSession("session-a");
+  const checkpoint = sessions.getCheckpointRef("session-a", "checkpoint_000");
+
+  await files.write(session.paths.journalPath, encoder.encode("journal"));
+  await files.write(checkpoint.completePath, encoder.encode(""));
+  await sessions.deleteSession("session-a");
+
+  expect(await files.read(session.paths.journalPath)).toBeUndefined();
+  expect(await files.list(session.paths.kvDir)).toEqual([]);
+  expect(await sessions.openSession("session-a")).toBeUndefined();
+});
+
+test("manifest helpers read valid manifests and ignore corrupt JSON", async () => {
+  const { files, sessions } = makeStore();
+  const session = await sessions.createSession("session-a", {
+    modelId: "model-a",
+  });
+
+  expect(
+    await sessions.tryWriteManifest({
+      ...session.manifest!,
+      updatedAtMs: 1200,
+    }),
+  ).toBe(true);
+  expect(await sessions.readManifest("session-a")).toMatchObject({
+    modelId: "model-a",
+    updatedAtMs: 1200,
+  });
+
+  await files.write(session.paths.manifestPath, encoder.encode("{bad"));
+  expect(await sessions.readManifest("session-a")).toBeUndefined();
+});
+
+test("rebuild inputs use journal presence and committed checkpoints", async () => {
+  const { files, sessions } = makeStore();
+  const session = await sessions.createSession("session-a");
+  const committed = sessions.getCheckpointRef("session-a", "checkpoint_000");
+  const incomplete = sessions.getCheckpointRef("session-a", "checkpoint_001");
+
+  await files.write(committed.completePath, encoder.encode(""));
+  await files.write(`${incomplete.path}/meta.json`, encoder.encode("{}"));
+  await appendJournalRecord(files, session.paths.journalPath, {
+    type: JournalRecordType.CheckpointCommit,
+    seqNo: 1,
+    createdAtMs: 1000,
+    payload: {
+      checkpointId: "checkpoint_000",
+      processedSeqLen: 32,
+      path: committed.path,
+    },
+  });
+
+  const inputs = await sessions.getManifestRebuildInputs("session-a");
+  expect(inputs?.hasJournal).toBe(true);
+  expect(inputs?.journalPath).toBe(session.paths.journalPath);
+  expect(inputs?.checkpoints.map((item) => item.checkpointId)).toEqual([
+    "checkpoint_000",
+  ]);
+});
+
+test("startup cleanup removes incomplete checkpoints across sessions", async () => {
+  const { files, sessions } = makeStore();
+  await sessions.createSession("session-a");
+  await sessions.createSession("session-b");
+  const keep = sessions.getCheckpointRef("session-a", "checkpoint_keep");
+  const dropA = sessions.getCheckpointRef("session-a", "checkpoint_drop");
+  const dropB = sessions.getCheckpointRef("session-b", "checkpoint_drop");
+
+  await files.write(keep.completePath, encoder.encode(""));
+  await files.write(`${dropA.path}/meta.json`, encoder.encode("{}"));
+  await files.write(`${dropB.path}/meta.json`, encoder.encode("{}"));
+
+  const removed = await sessions.cleanupIncompleteCheckpoints();
+
+  expect(removed.map((item) => `${item.checkpointId}:${item.path}`)).toEqual([
+    "checkpoint_drop:resume-root/sessions/session-a/kv/checkpoint_drop",
+    "checkpoint_drop:resume-root/sessions/session-b/kv/checkpoint_drop",
+  ]);
+  expect(await files.list("resume-root/sessions/session-a/kv")).toEqual([
+    "checkpoint_keep",
+  ]);
+  expect(await files.list("resume-root/sessions/session-b/kv")).toEqual([]);
+});

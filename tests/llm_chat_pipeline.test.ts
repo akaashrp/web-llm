@@ -420,13 +420,17 @@ test("prefillStep compiles custom grammar when response type is grammar", async 
 
 test("getInputData uses cached prompts when KV cache filled", async () => {
   const pipeline = createPipeline();
-  pipeline["tokenizer"].encode = jest.fn(() => Int32Array.from([1]));
+  pipeline["tokenizer"].encode = jest.fn((prompt: string) =>
+    Int32Array.from(prompt === "prompt" ? [1, 2, 3] : [4]),
+  );
   pipeline["conversation"].config.system_prefix_token_ids = undefined;
   pipeline["filledKVCacheLength"] = 0;
-  await (pipeline as any).getInputData();
+  const [fullPrompt] = await (pipeline as any).getInputData();
+  expect(fullPrompt).toEqual([[1, 2, 3]]);
   expect(pipeline["conversation"].getPromptArray).toHaveBeenCalled();
   pipeline["filledKVCacheLength"] = 1;
-  await (pipeline as any).getInputData();
+  const [lastRoundPrompt] = await (pipeline as any).getInputData();
+  expect(lastRoundPrompt).toEqual([[4]]);
   expect(pipeline["conversation"].getPromptArrayLastRound).toHaveBeenCalled();
 });
 

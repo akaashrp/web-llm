@@ -954,6 +954,27 @@ describe("MLCEngine deterministic integration", () => {
     ]);
   });
 
+  test("resumable prefill does not reuse a compatible conversation KV cache", () => {
+    const { engine, pipeline } = createEngineWithPipeline(1);
+    const request: ChatCompletionRequest = {
+      model: MODEL_ID,
+      messages: [
+        { role: "user", content: "First" },
+        { role: "assistant", content: "Answer" },
+        { role: "user", content: "Second" },
+      ],
+    };
+    const internal = engine as any;
+
+    internal.preparePrefillInput(request, pipeline, mockChatConfig, true);
+    pipeline.resetCount = 0;
+    internal.preparePrefillInput(request, pipeline, mockChatConfig, true);
+    expect(pipeline.resetCount).toBe(0);
+
+    internal.preparePrefillInput(request, pipeline, mockChatConfig, false);
+    expect(pipeline.resetCount).toBe(1);
+  });
+
   test("exact-mode resumable streaming waits for generated token journal append", async () => {
     const { engine } = createEngineWithPipeline(1);
     const files = new MemoryFileStore();

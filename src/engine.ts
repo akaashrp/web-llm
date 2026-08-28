@@ -206,6 +206,10 @@ interface DecodeCheckpointScheduler {
   pageSize?: number;
 }
 
+interface EngineSamplePrefillOptions extends SamplePrefillOptions {
+  reuseKVCache?: boolean;
+}
+
 interface KVResumeCheckpoint {
   checkpoint: KVCheckpointData;
   coveredGeneratedTokens: ReplayedGenerationToken[];
@@ -1349,6 +1353,7 @@ export class MLCEngine implements MLCEngineInterface {
           capturePromptCheckpoint:
             journal.checkpointPrompt && (await hasKVCheckpointQuota()),
           storeCheckpointLogits: journal.storeCheckpointLogits,
+          reuseKVCache: false,
         },
       );
       if (prefillStep.promptTokenIds === undefined) {
@@ -1756,6 +1761,7 @@ export class MLCEngine implements MLCEngineInterface {
             capturePromptCheckpoint:
               journal.checkpointPrompt && (await hasKVCheckpointQuota()),
             storeCheckpointLogits: journal.storeCheckpointLogits,
+            reuseKVCache: false,
           },
         );
         if (prefillStep.promptTokenIds === undefined) {
@@ -2682,12 +2688,13 @@ export class MLCEngine implements MLCEngineInterface {
    * @param input The OpenAI-style prompt to prefill.
    * @param pipeline The loaded pipeline, hence model, to carry out this prefill.
    * @param chatConfig The chat config to use for this model.
-   * @param genConfig Generation config.
+   * @param reuseKVCache Whether a matching conversation may reuse its existing KV cache.
    */
   private preparePrefillInput(
     input: ChatCompletionRequest | CompletionCreateParams,
     pipeline: LLMChatPipeline,
     chatConfig: ChatConfig,
+    reuseKVCache = true,
   ): {
     inputStr: string;
     lastMsgRole: Role;
@@ -2708,7 +2715,7 @@ export class MLCEngine implements MLCEngineInterface {
         input,
         chatConfig,
       );
-      if (!compareConversationObject(oldConv, newConv)) {
+      if (!reuseKVCache || !compareConversationObject(oldConv, newConv)) {
         // Not the same conversation, so not multiround chatting, reset everything (KV cache, etc.)
         pipeline.resetChat();
         pipeline.setConversation(newConv);
@@ -2761,19 +2768,21 @@ export class MLCEngine implements MLCEngineInterface {
     pipeline: LLMChatPipeline,
     chatConfig: ChatConfig,
     genConfig: GenerationConfig,
-    opts?: SamplePrefillOptions,
+    opts: EngineSamplePrefillOptions = {},
   ): Promise<SampledGenerationStep> {
+    const { reuseKVCache = true, ...pipelineOpts } = opts;
     const { inputStr, lastMsgRole, inputRoleStr } = this.preparePrefillInput(
       input,
       pipeline,
       chatConfig,
+      reuseKVCache,
     );
     return pipeline.samplePrefillStep(
       inputStr,
       lastMsgRole,
       inputRoleStr,
       genConfig,
-      opts,
+      pipelineOpts,
     );
   }
 

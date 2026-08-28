@@ -2,6 +2,7 @@ import { LLMChatPipeline } from "../src/llm_chat";
 import { MinValueError } from "../src/error";
 import { Role } from "../src/config";
 import { jest, test, expect, beforeEach } from "@jest/globals";
+import log from "loglevel";
 
 jest.mock("@mlc-ai/web-xgrammar", () => {
   const grammarMatcherInstances: any[] = [];
@@ -379,6 +380,66 @@ test("getKVCheckpointFunc uses a scope and caches packed functions", () => {
   expect(pipeline["tvm"].detachFromCurrentScope).toHaveBeenCalledWith(func);
   expect(pipeline["tvm"].endScope).toHaveBeenCalledTimes(1);
   expect(pipeline["tvm"].getGlobalFunc).toHaveBeenCalledTimes(1);
+});
+
+test("checkpoint capture disables itself when runtime globals are missing", async () => {
+  const pipeline = createPipeline();
+  const logits = {} as any;
+  const warn = jest.spyOn(log, "warn").mockImplementation(() => undefined);
+  pipeline["kvCache"] = {} as any;
+  pipeline["kvStateKind"] = "kv_cache";
+  pipeline["tvm"].getGlobalFunc = jest.fn(() => {
+    throw new Error("checkpoint global is missing");
+  });
+
+  await expect(
+    pipeline["tryExportPromptCheckpoint"](logits, true),
+  ).resolves.toBeUndefined();
+  await expect(
+    pipeline["tryExportPromptCheckpoint"](logits, true),
+  ).resolves.toBeUndefined();
+
+  expect(pipeline["tvm"].getGlobalFunc).toHaveBeenCalledTimes(1);
+  expect(pipeline["kvCheckpointUnavailableReason"]).toBe(
+    "checkpoint global is missing",
+  );
+  expect(warn).toHaveBeenCalledWith(
+    "KV checkpoint capture disabled for this model: checkpoint global is missing",
+  );
+  warn.mockRestore();
+});
+
+test("checkpoint capture disables itself when the runtime rejects the cache layout", async () => {
+  const pipeline = createPipeline();
+  const logits = {} as any;
+  const warn = jest.spyOn(log, "warn").mockImplementation(() => undefined);
+  pipeline["kvCache"] = {} as any;
+  pipeline["kvStateKind"] = "kv_cache";
+  pipeline["tvm"].getGlobalFunc = jest.fn((name: string) => {
+    const func = jest.fn(() => {
+      if (name === "vm.builtin.attention_kv_cache_get_checkpoint_metadata") {
+        throw new Error("cache layout does not support checkpoint export");
+      }
+    }) as any;
+    func.dispose = jest.fn();
+    return func;
+  });
+
+  await expect(
+    pipeline["tryExportPromptCheckpoint"](logits, true),
+  ).resolves.toBeUndefined();
+  await expect(
+    pipeline["tryExportPromptCheckpoint"](logits, true),
+  ).resolves.toBeUndefined();
+
+  expect(pipeline["tvm"].getGlobalFunc).toHaveBeenCalledTimes(6);
+  expect(pipeline["kvCheckpointUnavailableReason"]).toBe(
+    "cache layout does not support checkpoint export",
+  );
+  expect(warn).toHaveBeenCalledWith(
+    "KV checkpoint capture disabled for this model: cache layout does not support checkpoint export",
+  );
+  warn.mockRestore();
 });
 
 test("prefillStep reuses grammar matcher when schema unchanged", async () => {

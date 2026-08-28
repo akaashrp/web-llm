@@ -59,6 +59,15 @@ type ResolvedModelABI = {
 
 type CommitTokenSource = "prefill" | "decode";
 
+const KV_CHECKPOINT_FUNC_NAMES = [
+  "vm.builtin.attention_kv_cache_get_checkpoint_metadata",
+  "vm.builtin.attention_kv_cache_export_page_group",
+  "vm.builtin.attention_kv_cache_prepare_import",
+  "vm.builtin.attention_kv_cache_import_page_group",
+  "vm.builtin.attention_kv_cache_finish_import",
+  "vm.builtin.attention_kv_cache_get_sequence_length",
+] as const;
+
 type ForwardPrefillResult = {
   logits: tvmjs.Tensor;
   promptLen: number;
@@ -152,6 +161,10 @@ function commonPrefixLength(lhs: string, rhs: string): number {
   return prefixLength;
 }
 
+function errorMessage(err: unknown): string {
+  return err instanceof Error ? err.message : String(err);
+}
+
 export class LLMChatPipeline {
   private config: ChatConfig;
   private tokenizer: Tokenizer;
@@ -186,6 +199,7 @@ export class LLMChatPipeline {
   private kvCache?: tvmjs.TVMObject = undefined;
   private rnnState?: tvmjs.TVMObject = undefined;
   private kvCheckpointFuncs = new Map<string, tvmjs.PackedFunc>();
+  private kvCheckpointUnavailableReason?: string;
   private prefillLogitPositions?: tvmjs.Tensor = undefined;
   private prefillLogitPositionHost = new Int32Array(1);
   private maxHistorySize = 1;
@@ -975,7 +989,7 @@ export class LLMChatPipeline {
       await this.forwardPrefill(inp, msgRole, inp_role_str, genConfig);
     const promptCheckpoint =
       opts.capturePromptCheckpoint === true
-        ? await this.exportPromptCheckpoint(
+        ? await this.tryExportPromptCheckpoint(
             logits,
             opts.storeCheckpointLogits !== false,
           )
@@ -1131,7 +1145,7 @@ export class LLMChatPipeline {
     const logits = await this.forwardDecodeToken(lastToken);
     const decodeCheckpoint =
       opts.captureCheckpoint === true
-        ? await this.exportPromptCheckpoint(
+        ? await this.tryExportPromptCheckpoint(
             logits,
             opts.storeCheckpointLogits !== false,
           )
@@ -1336,6 +1350,34 @@ export class LLMChatPipeline {
       return func;
     } finally {
       this.tvm.endScope();
+    }
+  }
+
+  private resolveKVCheckpointFuncs(): void {
+    for (const name of KV_CHECKPOINT_FUNC_NAMES) {
+      this.getKVCheckpointFunc(name);
+    }
+  }
+
+  private async tryExportPromptCheckpoint(
+    logits: tvmjs.Tensor,
+    storeCheckpointLogits: boolean,
+  ): Promise<KVCheckpointData | undefined> {
+    if (this.kvCache === undefined || this.kvStateKind !== "kv_cache") {
+      return undefined;
+    }
+    if (this.kvCheckpointUnavailableReason !== undefined) {
+      return undefined;
+    }
+    try {
+      this.resolveKVCheckpointFuncs();
+      return await this.exportPromptCheckpoint(logits, storeCheckpointLogits);
+    } catch (err) {
+      this.kvCheckpointUnavailableReason = errorMessage(err);
+      log.warn(
+        `KV checkpoint capture disabled for this model: ${this.kvCheckpointUnavailableReason}`,
+      );
+      return undefined;
     }
   }
 

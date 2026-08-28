@@ -32,6 +32,7 @@ import type {
 } from "../src/resumable/fault_injection";
 import { ResumableSessionStore } from "../src/resumable/session_store";
 import { jest, test, expect, describe, afterEach } from "@jest/globals";
+import log from "loglevel";
 
 type ChatConfig = import("../src/config").ChatConfig;
 type Conversation = import("../src/conversation").Conversation;
@@ -1430,6 +1431,58 @@ describe("MLCEngine deterministic integration", () => {
     expect(pipeline.resetCount).toBe(resetCountAfterResume);
   });
 
+  test("resumeChatCompletion falls back to token replay when its only checkpoint is corrupt", async () => {
+    const { engine, pipeline } = createEngineWithPipeline(3);
+    pipeline.enablePromptCheckpoint = true;
+    const files = new MemoryFileStore();
+    attachResumableStore(engine, files);
+    const sessionId = "session-corrupt-prompt-checkpoint";
+    const iterable = (await engine.chatCompletion({
+      model: MODEL_ID,
+      seed: 1234,
+      messages: [{ role: "user", content: "Corrupt KV" }],
+      stream: true,
+      extra_body: {
+        resumable: {
+          enabled: true,
+          sessionId,
+        },
+      },
+    })) as AsyncIterable<ChatCompletionChunk>;
+    const iterator = iterable[Symbol.asyncIterator]();
+
+    await iterator.next();
+    await engine.interruptGenerate();
+    while (!(await iterator.next()).done) {
+      // drain the generator so asyncGenerate records the abort and releases the lock
+    }
+
+    const kvRoot = `resume-root/sessions/${sessionId}/kv`;
+    const checkpoints = await files.list(kvRoot);
+    expect(checkpoints).toHaveLength(1);
+    await files.write(
+      `${kvRoot}/${checkpoints[0]}/meta.json`,
+      new TextEncoder().encode("{"),
+    );
+    const warn = jest.spyOn(log, "warn").mockImplementation(() => undefined);
+
+    const result = (await engine.resumeChatCompletion(sessionId, {
+      continueGeneration: true,
+    })) as import("../src/types").ResumeResult;
+    expect(result).toMatchObject({
+      sessionId,
+      recoveryMode: "token_replay",
+      replayedTokens: 1,
+      recoveredText: "user:Corrupt KV|token1||token2||token3|",
+    });
+    expect(pipeline.promptCheckpointRestoreCount).toBe(0);
+    expect(warn).toHaveBeenCalledWith(
+      `Ignoring invalid KV checkpoint ${checkpoints[0]}:`,
+      expect.any(SyntaxError),
+    );
+    warn.mockRestore();
+  });
+
   test("resumable crash after GENERATED_TOKEN append resumes by token replay", async () => {
     const { engine } = createEngineWithPipeline(3);
     const files = new MemoryFileStore();
@@ -1784,6 +1837,77 @@ describe("MLCEngine deterministic integration", () => {
       recoveredText: "user:KVdecode|token1||token2||token3||token4||token5|",
     });
     expect(pipeline.restoredCheckpointSeqLen).toBe(10);
+  });
+
+  test("resumeChatCompletion skips a corrupt newer checkpoint and restores an older one", async () => {
+    const { engine, pipeline } = createEngineWithPipeline(7);
+    pipeline.enableDecodeCheckpoint = true;
+    pipeline.checkpointPageSize = 2;
+    const files = new MemoryFileStore();
+    attachResumableStore(engine, files);
+    const sessionId = "session-corrupt-newest-checkpoint";
+    const iterable = (await engine.chatCompletion({
+      model: MODEL_ID,
+      seed: 1234,
+      messages: [{ role: "user", content: "KVdecode" }],
+      stream: true,
+      extra_body: {
+        resumable: {
+          enabled: true,
+          sessionId,
+          checkpointPrompt: false,
+          checkpointIntervalTokens: 2,
+        },
+      },
+    })) as AsyncIterable<ChatCompletionChunk>;
+    const iterator = iterable[Symbol.asyncIterator]();
+
+    for (let i = 0; i < 5; i++) {
+      await iterator.next();
+    }
+    await engine.interruptGenerate();
+    while (!(await iterator.next()).done) {
+      // drain the generator so asyncGenerate records the abort and releases the lock
+    }
+
+    const kvRoot = `resume-root/sessions/${sessionId}/kv`;
+    const checkpoints = await files.list(kvRoot);
+    expect(checkpoints).toEqual([
+      "checkpoint_00000000_00000010",
+      "checkpoint_00000000_00000012",
+    ]);
+    const newestCheckpoint = checkpoints[1];
+    const newestPath = `${kvRoot}/${newestCheckpoint}`;
+    const pageGroupFile = (await files.list(newestPath)).find((name) =>
+      name.endsWith(".wkv"),
+    );
+    expect(pageGroupFile).toBeDefined();
+    const pageGroupPath = `${newestPath}/${pageGroupFile!}`;
+    const pageGroupData = await files.read(pageGroupPath);
+    expect(pageGroupData).toBeDefined();
+    const corruptPageGroup = new Uint8Array(pageGroupData!);
+    corruptPageGroup[0] ^= 1;
+    await files.write(pageGroupPath, corruptPageGroup);
+    const warn = jest.spyOn(log, "warn").mockImplementation(() => undefined);
+
+    const result = (await engine.resumeChatCompletion(sessionId, {
+      continueGeneration: true,
+    })) as import("../src/types").ResumeResult;
+    expect(result).toMatchObject({
+      sessionId,
+      recoveryMode: "kv",
+      replayedTokens: 3,
+      recoveredText:
+        "user:KVdecode|token1||token2||token3||token4||token5||token6||token7|",
+    });
+    expect(pipeline.restoredCheckpointSeqLen).toBe(10);
+    expect(warn).toHaveBeenCalledWith(
+      `Ignoring invalid KV checkpoint ${newestCheckpoint}:`,
+      expect.objectContaining({
+        message: expect.stringContaining("CRC mismatch"),
+      }),
+    );
+    warn.mockRestore();
   });
 
   test("resumeChatCompletion falls back to text-only when model is unavailable", async () => {

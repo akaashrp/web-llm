@@ -717,15 +717,24 @@ export class MLCEngine implements MLCEngineInterface {
     const refs = await sessions.listCommittedCheckpoints(session.sessionId);
     let best: KVCheckpointData | undefined;
     for (const ref of refs) {
-      const payload = await readResumableCheckpointPayload(files, ref);
-      if (
-        payload !== undefined &&
-        payload.meta.processedSeqLen >= promptSeqLen &&
-        payload.meta.processedSeqLen <= state.processedSeqLen &&
-        (best === undefined ||
-          payload.meta.processedSeqLen > best.processedSeqLen)
-      ) {
-        best = this.checkpointPayloadToKVData(payload);
+      try {
+        const payload = await readResumableCheckpointPayload(files, ref);
+        if (payload === undefined) {
+          log.warn(
+            `Ignoring invalid KV checkpoint ${ref.checkpointId}: checkpoint payload is incomplete.`,
+          );
+          continue;
+        }
+        if (
+          payload.meta.processedSeqLen >= promptSeqLen &&
+          payload.meta.processedSeqLen <= state.processedSeqLen &&
+          (best === undefined ||
+            payload.meta.processedSeqLen > best.processedSeqLen)
+        ) {
+          best = this.checkpointPayloadToKVData(payload);
+        }
+      } catch (err) {
+        log.warn(`Ignoring invalid KV checkpoint ${ref.checkpointId}:`, err);
       }
     }
     if (best === undefined) {
@@ -768,16 +777,16 @@ export class MLCEngine implements MLCEngineInterface {
       return undefined;
     }
 
-    const resume = await this.readBestKVCheckpoint(
-      files,
-      sessions,
-      session,
-      state,
-    );
-    if (resume === undefined) {
-      return undefined;
-    }
     try {
+      const resume = await this.readBestKVCheckpoint(
+        files,
+        sessions,
+        session,
+        state,
+      );
+      if (resume === undefined) {
+        return undefined;
+      }
       if (resume.tailGeneratedTokens.length === 0) {
         const seed = requestSeed(state.request);
         const rngState = resume.coveredGeneratedTokens.at(-1)?.rngState;

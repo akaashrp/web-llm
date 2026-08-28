@@ -33,6 +33,7 @@ export interface ResumableGeneratedTokenInput {
   globalTokenPos: number;
   tokenId: number;
   textDelta: string;
+  textPrefixLength: number;
   rngState?: unknown;
   logprob?: unknown;
 }
@@ -192,6 +193,7 @@ export class ResumableGenerationJournal {
       globalTokenPos: input.globalTokenPos,
       tokenId: input.tokenId,
       textDelta: input.textDelta,
+      textPrefixLength: input.textPrefixLength,
     };
     if (input.rngState !== undefined) {
       payload.rngState = input.rngState;

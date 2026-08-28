@@ -129,6 +129,7 @@ export interface CommittedGenerationStep {
   tokenId: number;
   globalTokenPos: number;
   textDelta: string;
+  textPrefixLength: number;
   outputMessage: string;
   stopped: boolean;
   finishReason?: ChatCompletionFinishReason;
@@ -138,7 +139,17 @@ export interface ReplayedGenerationToken {
   globalTokenPos: number;
   tokenId: number;
   textDelta: string;
+  textPrefixLength?: number;
   rngState?: unknown;
+}
+
+function commonPrefixLength(lhs: string, rhs: string): number {
+  const limit = Math.min(lhs.length, rhs.length);
+  let prefixLength = 0;
+  while (prefixLength < limit && lhs[prefixLength] === rhs[prefixLength]) {
+    prefixLength++;
+  }
+  return prefixLength;
 }
 
 export class LLMChatPipeline {
@@ -1281,14 +1292,17 @@ export class LLMChatPipeline {
   ): CommittedGenerationStep {
     const prevOutputMessage = this.outputMessage;
     this.commitSampledToken(step.tokenId, genConfig, step.source);
-    const textDelta = this.outputMessage.startsWith(prevOutputMessage)
-      ? this.outputMessage.slice(prevOutputMessage.length)
-      : this.outputMessage;
+    const textPrefixLength = commonPrefixLength(
+      prevOutputMessage,
+      this.outputMessage,
+    );
+    const textDelta = this.outputMessage.slice(textPrefixLength);
     return {
       source: step.source,
       tokenId: step.tokenId,
       globalTokenPos: step.globalTokenPos,
       textDelta,
+      textPrefixLength,
       outputMessage: this.outputMessage,
       stopped: this.stopTriggered,
       finishReason: this.finishReason,

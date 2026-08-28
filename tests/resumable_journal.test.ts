@@ -12,7 +12,10 @@ import {
   ResumableGenerationJournal,
   normalizeResumableGenerationConfig,
 } from "../src/resumable/generation";
-import { readResumableReplayState } from "../src/resumable/replay";
+import {
+  applyGeneratedTokenText,
+  readResumableReplayState,
+} from "../src/resumable/replay";
 import { ResumableSessionStore } from "../src/resumable/session_store";
 import { test, expect } from "@jest/globals";
 
@@ -213,6 +216,18 @@ test("journal append and read helpers use OPFS file store", async () => {
     records: [],
     validBytes: 0,
   });
+});
+
+test("text replay applies reversible patches and legacy deltas", () => {
+  let text = applyGeneratedTokenText("", "caf\ufffd", 0);
+  text = applyGeneratedTokenText(text, "\u00e9", 3);
+  text = applyGeneratedTokenText(text, "!", text.length);
+  text = applyGeneratedTokenText(text, " legacy");
+
+  expect(text).toBe("caf\u00e9! legacy");
+  expect(() => applyGeneratedTokenText("short", "bad", 6)).toThrow(
+    "Invalid resumable text prefix length 6 for text of length 5.",
+  );
 });
 
 test("resumable generation journal rejects active writers and session reuse", async () => {

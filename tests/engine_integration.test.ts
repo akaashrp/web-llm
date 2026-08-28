@@ -273,6 +273,7 @@ jest.mock("../src/llm_chat", () => {
         tokenId: step.tokenId,
         globalTokenPos: step.globalTokenPos,
         textDelta: this.message.slice(prevMessage.length),
+        textPrefixLength: prevMessage.length,
         outputMessage: this.message,
         stopped: this.stopFlag,
         finishReason: this.finishReason,
@@ -291,7 +292,11 @@ jest.mock("../src/llm_chat", () => {
     async replayGenerationTokens(
       promptTokenIds: number[],
       _assistantPrefixTokenIds: number[],
-      generatedTokens: Array<{ tokenId: number; textDelta: string }>,
+      generatedTokens: Array<{
+        tokenId: number;
+        textDelta: string;
+        textPrefixLength?: number;
+      }>,
     ) {
       this.resetChat();
       this.stopFlag = false;
@@ -304,14 +309,27 @@ jest.mock("../src/llm_chat", () => {
       this.decodeCallCount = Math.max(0, generatedTokens.length - 1);
       this.curRoundDecodingTotalTokens = 0;
       this.curRoundDecodingTotalTime = 0.001;
-      this.message = generatedTokens.map((token) => token.textDelta).join("");
+      this.message = generatedTokens.reduce(
+        (message, token) =>
+          message.slice(0, token.textPrefixLength ?? message.length) +
+          token.textDelta,
+        "",
+      );
     }
 
     async replayFromPromptCheckpoint(
       checkpoint: { processedSeqLen?: number },
       _assistantPrefixTokenIds: number[],
-      coveredTokens: Array<{ tokenId: number; textDelta: string }>,
-      tailTokens: Array<{ tokenId: number; textDelta: string }>,
+      coveredTokens: Array<{
+        tokenId: number;
+        textDelta: string;
+        textPrefixLength?: number;
+      }>,
+      tailTokens: Array<{
+        tokenId: number;
+        textDelta: string;
+        textPrefixLength?: number;
+      }>,
     ) {
       this.promptCheckpointRestoreCount++;
       this.restoredCheckpointSeqLen = checkpoint.processedSeqLen ?? 0;
@@ -322,7 +340,12 @@ jest.mock("../src/llm_chat", () => {
       this.decodeCallCount = Math.max(0, generatedTokens.length - 1);
       this.curRoundDecodingTotalTokens = 0;
       this.curRoundDecodingTotalTime = 0.001;
-      this.message = generatedTokens.map((token) => token.textDelta).join("");
+      this.message = generatedTokens.reduce(
+        (message, token) =>
+          message.slice(0, token.textPrefixLength ?? message.length) +
+          token.textDelta,
+        "",
+      );
       return {
         replayedTokens: tailTokens.length,
         sampledFromCheckpointLogits: false,

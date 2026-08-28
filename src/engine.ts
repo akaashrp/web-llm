@@ -511,6 +511,7 @@ export class MLCEngine implements MLCEngineInterface {
         globalTokenPos: sampled.globalTokenPos,
         tokenId: sampled.tokenId,
         textDelta: committed.textDelta,
+        textPrefixLength: committed.textPrefixLength,
         rngState: pipeline.getRNGState(),
         logprob: sampled.logprob,
       });
@@ -924,7 +925,7 @@ export class MLCEngine implements MLCEngineInterface {
     const streamState: StreamGenerationState = {
       id: crypto.randomUUID(),
       created: getUnixTimestampSeconds(),
-      prevMessageLength: state.recoveredText.length,
+      prevMessageLength: pipeline.getMessage().length,
     };
 
     try {

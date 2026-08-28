@@ -122,6 +122,26 @@ export function hasUnsupportedGrammarReplay(
   );
 }
 
+export function applyGeneratedTokenText(
+  previousText: string,
+  textDelta: string,
+  textPrefixLength?: number,
+): string {
+  if (textPrefixLength === undefined) {
+    return previousText + textDelta;
+  }
+  if (
+    !Number.isInteger(textPrefixLength) ||
+    textPrefixLength < 0 ||
+    textPrefixLength > previousText.length
+  ) {
+    throw new Error(
+      `Invalid resumable text prefix length ${textPrefixLength} for text of length ${previousText.length}.`,
+    );
+  }
+  return previousText.slice(0, textPrefixLength) + textDelta;
+}
+
 function summarizeReplayState(
   session: ResumableSessionHandle,
   scan: JournalScanResult,
@@ -135,6 +155,7 @@ function summarizeReplayState(
   let processedSeqLen = 0;
   let finished = false;
   let sessionBeginCount = 0;
+  let recoveredText = "";
   const generatedTokens: ReplayedGenerationToken[] = [];
 
   for (const record of scan.records) {
@@ -168,10 +189,16 @@ function summarizeReplayState(
         resumableConfig = getResumableGenerationConfig(record);
         break;
       case JournalRecordType.GeneratedToken:
+        recoveredText = applyGeneratedTokenText(
+          recoveredText,
+          record.payload.textDelta,
+          record.payload.textPrefixLength,
+        );
         generatedTokens.push({
           globalTokenPos: record.payload.globalTokenPos,
           tokenId: record.payload.tokenId,
           textDelta: record.payload.textDelta,
+          textPrefixLength: record.payload.textPrefixLength,
           rngState: record.payload.rngState,
         });
         processedSeqLen = Math.max(
@@ -192,7 +219,7 @@ function summarizeReplayState(
     promptTokenIds,
     assistantPrefixTokenIds,
     generatedTokens,
-    recoveredText: generatedTokens.map((token) => token.textDelta).join(""),
+    recoveredText,
     emittedTokens: generatedTokens.length,
     processedSeqLen,
     generationConfig,

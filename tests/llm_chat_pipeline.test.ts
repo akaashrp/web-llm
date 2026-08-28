@@ -183,6 +183,24 @@ test("processNextToken appends tokens until stop string reached", () => {
   expect(pipeline["outputMessage"]).toBe("partial");
 });
 
+test("commitSampledStep records a reversible text rewrite", () => {
+  const pipeline = createPipeline();
+  pipeline["outputMessage"] = "caf\ufffd";
+  pipeline["commitSampledToken"] = jest.fn(() => {
+    pipeline["outputMessage"] = "caf\u00e9";
+  });
+
+  const committed = pipeline.commitSampledStep({
+    source: "decode",
+    tokenId: 2,
+    globalTokenPos: 10,
+  });
+
+  expect(committed.textPrefixLength).toBe(3);
+  expect(committed.textDelta).toBe("\u00e9");
+  expect(committed.outputMessage).toBe("caf\u00e9");
+});
+
 test("processNextToken respects max_tokens and updates token frequency", () => {
   const pipeline = createPipeline();
   (pipeline as any).processNextToken(7, { max_tokens: 1 });

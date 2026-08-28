@@ -45,6 +45,11 @@ export interface GeneratedTokenPayload {
   globalTokenPos: number;
   tokenId: number;
   textDelta: string;
+  /**
+   * Number of UTF-16 code units retained from the previously recovered text.
+   * Absent on legacy append-only records.
+   */
+  textPrefixLength?: number;
   rngState?: unknown;
   logprob?: unknown;
 }

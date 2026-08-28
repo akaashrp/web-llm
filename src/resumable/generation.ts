@@ -147,19 +147,11 @@ export class ResumableGenerationJournal {
     }
     this.releaseSessionLock = releaseSessionLock;
 
-    this.session = await this.sessions.createSession(this.config.sessionId, {
-      modelId: init.modelId,
-    });
     try {
-      const scan = await readJournalRecords(
-        this.files,
-        this.session.paths.journalPath,
+      this.session = await this.sessions.createNewSession(
+        this.config.sessionId,
+        { modelId: init.modelId },
       );
-      this.seqNo =
-        scan.records.length === 0
-          ? 0
-          : Math.max(...scan.records.map((record) => record.seqNo));
-
       await this.writeInitialRecords(init);
     } catch (err) {
       this.releaseSessionLock?.();

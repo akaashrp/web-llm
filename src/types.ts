@@ -32,6 +32,10 @@ export type InitProgressCallback = (report: InitProgressReport) => void;
 
 export interface ResumableGenerationConfig {
   enabled: boolean;
+  /**
+   * Unique identity for this generation. An existing session must be resumed or
+   * deleted before this identifier can be used for a new generation.
+   */
   sessionId?: string;
   checkpointIntervalTokens?: number;
   checkpointPrompt?: boolean;

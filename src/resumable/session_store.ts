@@ -134,6 +134,37 @@ export class ResumableSessionStore {
     return { sessionId, paths, manifest };
   }
 
+  async createNewSession(
+    sessionId: string,
+    init: ResumableSessionManifestInit = {},
+  ): Promise<ResumableSessionHandle> {
+    const paths = this.getSessionPaths(sessionId);
+    await this.files.mkdir(paths.sessionDir);
+    const [manifestData, journalData, entries] = await Promise.all([
+      this.files.read(paths.manifestPath),
+      this.files.read(paths.journalPath),
+      this.files.list(paths.sessionDir),
+    ]);
+    const persistedEntries = entries.filter((entry) => entry !== LOCK_FILE);
+    if (
+      manifestData !== undefined ||
+      journalData !== undefined ||
+      persistedEntries.length > 0
+    ) {
+      throw new Error(`Resumable session already exists: ${sessionId}`);
+    }
+
+    const now = this.now();
+    const manifest: ResumableSessionManifest = {
+      ...init,
+      sessionId,
+      createdAtMs: init.createdAtMs ?? now,
+      updatedAtMs: init.updatedAtMs ?? now,
+    };
+    await this.tryWriteManifest(manifest);
+    return { sessionId, paths, manifest };
+  }
+
   async openSession(
     sessionId: string,
   ): Promise<ResumableSessionHandle | undefined> {

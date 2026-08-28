@@ -12,6 +12,7 @@ import {
   ResumableGenerationJournal,
   normalizeResumableGenerationConfig,
 } from "../src/resumable/generation";
+import { readResumableReplayState } from "../src/resumable/replay";
 import { ResumableSessionStore } from "../src/resumable/session_store";
 import { test, expect } from "@jest/globals";
 
@@ -214,7 +215,7 @@ test("journal append and read helpers use OPFS file store", async () => {
   });
 });
 
-test("resumable generation journal rejects a second active writer", async () => {
+test("resumable generation journal rejects active writers and session reuse", async () => {
   const store = new MemoryFileStore();
   const sessions = new ResumableSessionStore(store, {
     rootPath: "resume-root",
@@ -239,6 +240,30 @@ test("resumable generation journal rejects a second active writer", async () => 
   );
 
   await first.close();
-  await second.begin(init);
-  await second.close();
+  await expect(second.begin(init)).rejects.toThrow(
+    "Resumable session already exists: session-a",
+  );
+});
+
+test("replay rejects journals containing multiple session beginnings", async () => {
+  const store = new MemoryFileStore();
+  const sessions = new ResumableSessionStore(store, {
+    rootPath: "resume-root",
+  });
+  const session = await sessions.createSession("session-a");
+  const sessionBegin = record({
+    type: JournalRecordType.SessionBegin,
+    seqNo: 1,
+    createdAtMs: 100,
+    payload: { sessionId: "session-a", modelId: "model-a" },
+  });
+  await appendJournalRecord(store, session.paths.journalPath, sessionBegin);
+  await appendJournalRecord(store, session.paths.journalPath, {
+    ...sessionBegin,
+    seqNo: 2,
+  });
+
+  await expect(readResumableReplayState(store, session)).rejects.toThrow(
+    "Resumable session session-a contains multiple session-begin records.",
+  );
 });

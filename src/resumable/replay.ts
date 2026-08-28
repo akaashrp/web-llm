@@ -134,11 +134,23 @@ function summarizeReplayState(
   let resumableConfig: NormalizedResumableGenerationConfig | undefined;
   let processedSeqLen = 0;
   let finished = false;
+  let sessionBeginCount = 0;
   const generatedTokens: ReplayedGenerationToken[] = [];
 
   for (const record of scan.records) {
     switch (record.type) {
       case JournalRecordType.SessionBegin:
+        sessionBeginCount++;
+        if (sessionBeginCount > 1) {
+          throw new Error(
+            `Resumable session ${session.sessionId} contains multiple session-begin records.`,
+          );
+        }
+        if (record.payload.sessionId !== session.sessionId) {
+          throw new Error(
+            `Resumable journal session mismatch: expected ${session.sessionId}, got ${record.payload.sessionId}.`,
+          );
+        }
         if (modelId === "") {
           modelId = record.payload.modelId ?? "";
         }

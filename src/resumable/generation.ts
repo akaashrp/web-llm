@@ -2,13 +2,18 @@ import { GenerationConfig } from "../config";
 import { ResumableGenerationConfig } from "../types";
 import { OPFSFileStore } from "./opfs_file_store";
 import {
+  CheckpointCommitPayload,
   GeneratedTokenPayload,
   JournalRecord,
   JournalRecordType,
   appendJournalRecord,
   readJournalRecords,
 } from "./journal";
-import { ResumableSessionStore } from "./session_store";
+import { triggerResumableFault } from "./fault_injection";
+import {
+  ResumableSessionExistsError,
+  ResumableSessionStore,
+} from "./session_store";
 import { ResumableSessionHandle } from "./types";
 
 export interface NormalizedResumableGenerationConfig {
@@ -138,9 +143,23 @@ export class ResumableGenerationJournal {
     return this.config.strictPersistence;
   }
 
+  get active(): boolean {
+    return !this.disabled && this.session !== undefined;
+  }
+
   async begin(init: ResumableGenerationJournalInit): Promise<void> {
     const paths = this.sessions.getSessionPaths(this.config.sessionId);
-    const releaseSessionLock = await this.files.tryLock(paths.lockPath);
+    let releaseSessionLock: (() => void) | undefined;
+    try {
+      releaseSessionLock = await this.files.tryLock(paths.lockPath);
+    } catch (err) {
+      if (this.config.strictPersistence) {
+        throw err;
+      }
+      this.disabled = true;
+      this.pendingError = err;
+      return;
+    }
     if (releaseSessionLock === undefined) {
       throw new Error(
         `Resumable session is already active: ${this.config.sessionId}`,
@@ -157,6 +176,14 @@ export class ResumableGenerationJournal {
     } catch (err) {
       this.releaseSessionLock?.();
       this.releaseSessionLock = undefined;
+      if (
+        !this.config.strictPersistence &&
+        !(err instanceof ResumableSessionExistsError)
+      ) {
+        this.disabled = true;
+        this.pendingError = err;
+        return;
+      }
       throw err;
     }
   }
@@ -215,6 +242,28 @@ export class ResumableGenerationJournal {
       },
       shouldWait,
     );
+  }
+
+  async recordCheckpointCommit(
+    payload: CheckpointCommitPayload,
+  ): Promise<void> {
+    const faultContext = {
+      path: payload.path,
+      sessionId: this.sessionId,
+      checkpointId: payload.checkpointId,
+      processedSeqLen: payload.processedSeqLen,
+    };
+    await triggerResumableFault("checkpoint.before_commit", faultContext);
+    await this.append(
+      {
+        type: JournalRecordType.CheckpointCommit,
+        seqNo: this.nextSeqNo(),
+        createdAtMs: nowMs(),
+        payload,
+      },
+      true,
+    );
+    await triggerResumableFault("checkpoint.after_commit", faultContext);
   }
 
   async recordGenerationEnd(input: ResumableGenerationEndInput): Promise<void> {
@@ -347,6 +396,9 @@ export class ResumableGenerationJournal {
       return;
     }
     const write = this.pendingWrite.then(async () => {
+      if (this.disabled || this.pendingError !== undefined) {
+        return;
+      }
       if (this.session === undefined) {
         throw new Error("Resumable journal session is not initialized.");
       }
@@ -357,7 +409,7 @@ export class ResumableGenerationJournal {
       );
     });
     this.pendingWrite = write.catch((err) => {
-      this.pendingError = err;
+      this.pendingError ??= err;
     });
     if (!wait) {
       return;

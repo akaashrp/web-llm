@@ -358,6 +358,179 @@ test("decodeStep forwards last committed token and commits sampled token", async
   expect(pipeline["curRoundDecodingTotalTokens"]).toBe(1);
 });
 
+function prepareReplayPipeline(): PipelineLike {
+  const pipeline = createPipeline();
+  pipeline.resetChat = jest.fn();
+  pipeline.setConversation = jest.fn();
+  pipeline["resetGenerationRoundState"] = jest.fn();
+  pipeline["prepareGrammarMatcherForSampling"] = jest.fn(async () => undefined);
+  pipeline["outputIds"] = [];
+  return pipeline;
+}
+
+test("token replay samples and returns the first token when no token was journaled", async () => {
+  const pipeline = prepareReplayPipeline();
+  const promptLogits = { dispose: jest.fn() } as any;
+  const committed = {
+    source: "prefill",
+    tokenId: 17,
+    globalTokenPos: 3,
+    textDelta: "first",
+    textPrefixLength: 0,
+    outputMessage: "first",
+    stopped: false,
+  } as any;
+  pipeline["forwardKnownTokens"] = jest.fn(async () => promptLogits);
+  pipeline["sampleFromRawLogits"] = jest.fn(async () => 17);
+  pipeline.commitSampledStep = jest.fn(() => committed);
+
+  const result = await pipeline.replayGenerationTokens([1, 2, 3], [9], [], {
+    temperature: 0.5,
+  });
+
+  expect(pipeline["outputIds"]).toEqual([9]);
+  expect(pipeline["sampleFromRawLogits"]).toHaveBeenCalledWith(promptLogits, {
+    temperature: 0.5,
+  });
+  expect(pipeline.commitSampledStep).toHaveBeenCalledWith(
+    {
+      source: "prefill",
+      tokenId: 17,
+      globalTokenPos: 3,
+    },
+    { temperature: 0.5 },
+  );
+  expect(result).toEqual({
+    replayedTokens: 0,
+    sampledFromCheckpointLogits: false,
+    sampledToken: {
+      source: "prefill",
+      tokenId: 17,
+      globalTokenPos: 3,
+    },
+    committedToken: committed,
+  });
+  expect(promptLogits.dispose).toHaveBeenCalled();
+});
+
+test("token replay forwards all but the final known generated token", async () => {
+  const pipeline = prepareReplayPipeline();
+  const promptLogits = { dispose: jest.fn() } as any;
+  const decodeLogits = { dispose: jest.fn() } as any;
+  pipeline["forwardKnownTokens"] = jest.fn(async () => promptLogits);
+  pipeline["forwardDecodeToken"] = jest.fn(async () => decodeLogits);
+  pipeline["commitSampledToken"] = jest.fn();
+
+  const result = await pipeline.replayGenerationTokens(
+    [1, 2],
+    [8],
+    [
+      { globalTokenPos: 2, tokenId: 10, textDelta: "a" },
+      { globalTokenPos: 3, tokenId: 11, textDelta: "b" },
+    ],
+    { max_tokens: 4 },
+  );
+
+  expect(pipeline["forwardDecodeToken"]).toHaveBeenCalledTimes(1);
+  expect(pipeline["forwardDecodeToken"]).toHaveBeenCalledWith(10);
+  expect(decodeLogits.dispose).toHaveBeenCalled();
+  expect(pipeline["commitSampledToken"]).toHaveBeenNthCalledWith(
+    1,
+    10,
+    { max_tokens: 4 },
+    "decode",
+  );
+  expect(pipeline["commitSampledToken"]).toHaveBeenNthCalledWith(
+    2,
+    11,
+    { max_tokens: 4 },
+    "decode",
+  );
+  expect(result).toEqual({
+    replayedTokens: 2,
+    sampledFromCheckpointLogits: false,
+  });
+  expect(promptLogits.dispose).toHaveBeenCalled();
+});
+
+test("known-token forwarding detaches only the final chunk logits", async () => {
+  const pipeline = createPipeline();
+  const firstLogits = { dispose: jest.fn() } as any;
+  const finalLogits = { dispose: jest.fn() } as any;
+  pipeline["embedAndForward"] = jest
+    .fn<(...args: any[]) => Promise<any>>()
+    .mockImplementationOnce(async (_chunk, chunkLen) => {
+      pipeline["filledKVCacheLength"] += chunkLen;
+      return firstLogits;
+    })
+    .mockImplementationOnce(async (_chunk, chunkLen) => {
+      pipeline["filledKVCacheLength"] += chunkLen;
+      return finalLogits;
+    });
+
+  const result = await pipeline["forwardKnownTokens"](
+    Array.from({ length: 10 }, (_, index) => index),
+    true,
+  );
+
+  expect(pipeline["embedAndForward"]).toHaveBeenCalledTimes(2);
+  expect(pipeline["tvm"].detachFromCurrentScope).toHaveBeenCalledTimes(1);
+  expect(pipeline["tvm"].detachFromCurrentScope).toHaveBeenCalledWith(
+    finalLogits,
+  );
+  expect(result).toBe(finalLogits);
+  expect(pipeline["filledKVCacheLength"]).toBe(10);
+  expect(pipeline["tvm"].endScope).toHaveBeenCalled();
+});
+
+test("checkpoint replay exposes the token sampled from persisted logits", async () => {
+  const pipeline = prepareReplayPipeline();
+  const logits = {
+    copyFromRawBytes: jest.fn(),
+  } as any;
+  pipeline["kvCache"] = {} as any;
+  pipeline["importPromptCheckpoint"] = jest.fn(async () => {
+    pipeline["filledKVCacheLength"] = 4;
+  });
+  pipeline["tvm"].empty = jest.fn(() => logits);
+  pipeline["sampleFromRawLogits"] = jest.fn(async () => 21);
+  pipeline.commitSampledStep = jest.fn((sampled: any) => ({
+    ...sampled,
+    textDelta: "new",
+    textPrefixLength: 3,
+    outputMessage: "oldnew",
+    stopped: false,
+  }));
+
+  const result = await pipeline.replayFromPromptCheckpoint(
+    {
+      processedSeqLen: 4,
+      metadata: {},
+      pageGroups: [],
+      nextLogits: {
+        shape: [1, 4],
+        dtype: "float32",
+        data: new Uint8Array([1, 2, 3, 4]),
+      },
+    },
+    [],
+    [],
+    [],
+    { max_tokens: 5 },
+  );
+
+  expect(logits.copyFromRawBytes).toHaveBeenCalledWith(
+    new Uint8Array([1, 2, 3, 4]),
+  );
+  expect(result.sampledToken).toEqual({
+    source: "prefill",
+    tokenId: 21,
+    globalTokenPos: 4,
+  });
+  expect(result.committedToken?.textPrefixLength).toBe(3);
+  expect(result.sampledFromCheckpointLogits).toBe(true);
+});
+
 test("getKVCheckpointFunc uses a scope and caches packed functions", () => {
   const pipeline = createPipeline();
   const func = jest.fn() as any;

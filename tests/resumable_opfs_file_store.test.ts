@@ -1,5 +1,8 @@
-import { BrowserOPFSFileStore } from "../src/resumable/opfs_file_store";
-import { test, expect } from "@jest/globals";
+import {
+  BrowserOPFSFileStore,
+  CrossContextLockUnavailableError,
+} from "../src/resumable/opfs_file_store";
+import { jest, test, expect } from "@jest/globals";
 
 function domError(name: string): Error {
   const err = new Error(name);
@@ -233,28 +236,78 @@ test("OPFS file store lists, creates, and removes directories", async () => {
 });
 
 test.each([true, false])(
-  "OPFS file store lock serializes same-path contenders with syncAccess=%s",
+  "OPFS file store lock serializes same-path contenders with cross-context backend=%s",
   async (syncAccess) => {
+    const previousNavigator = Object.getOwnPropertyDescriptor(
+      globalThis,
+      "navigator",
+    );
+    const webLockRequest = jest.fn(
+      async (
+        _name: string,
+        _options: unknown,
+        callback: (lock: object) => Promise<void>,
+      ) => callback({}),
+    );
+    if (!syncAccess) {
+      Object.defineProperty(globalThis, "navigator", {
+        configurable: true,
+        value: { locks: { request: webLockRequest } },
+      });
+    }
     const store = makeStore(syncAccess);
 
-    const releaseFirst = await store.lock("locks/session");
-    let secondAcquired = false;
-    const secondLock = store.lock("locks/session").then((release) => {
-      secondAcquired = true;
-      return release;
-    });
+    try {
+      const releaseFirst = await store.lock("locks/session");
+      let secondAcquired = false;
+      const secondLock = store.lock("locks/session").then((release) => {
+        secondAcquired = true;
+        return release;
+      });
 
-    await tick();
-    expect(secondAcquired).toBe(false);
-    expect(await store.tryLock("locks/session")).toBeUndefined();
+      await tick();
+      expect(secondAcquired).toBe(false);
+      expect(await store.tryLock("locks/session")).toBeUndefined();
 
-    releaseFirst();
-    const releaseSecond = await secondLock;
-    expect(secondAcquired).toBe(true);
-    releaseSecond();
+      releaseFirst();
+      const releaseSecond = await secondLock;
+      expect(secondAcquired).toBe(true);
+      releaseSecond();
 
-    const releaseThird = await store.tryLock("locks/session");
-    expect(releaseThird).toBeDefined();
-    releaseThird!();
+      const releaseThird = await store.tryLock("locks/session");
+      expect(releaseThird).toBeDefined();
+      releaseThird!();
+      if (!syncAccess) {
+        expect(webLockRequest).toHaveBeenCalled();
+      }
+    } finally {
+      if (previousNavigator === undefined) {
+        delete (globalThis as any).navigator;
+      } else {
+        Object.defineProperty(globalThis, "navigator", previousNavigator);
+      }
+    }
   },
 );
+
+test("OPFS locking rejects process-only fallback", async () => {
+  const previousNavigator = Object.getOwnPropertyDescriptor(
+    globalThis,
+    "navigator",
+  );
+  Object.defineProperty(globalThis, "navigator", {
+    configurable: true,
+    value: {},
+  });
+  try {
+    await expect(
+      makeStore(false).tryLock("locks/session"),
+    ).rejects.toBeInstanceOf(CrossContextLockUnavailableError);
+  } finally {
+    if (previousNavigator === undefined) {
+      delete (globalThis as any).navigator;
+    } else {
+      Object.defineProperty(globalThis, "navigator", previousNavigator);
+    }
+  }
+});

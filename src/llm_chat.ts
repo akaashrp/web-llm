@@ -2782,9 +2782,9 @@ export class LLMChatPipeline {
   private async forwardKnownTokens(
     inputIds: Array<number>,
     isPrefill: boolean,
-  ): Promise<void> {
+  ): Promise<tvmjs.Tensor | undefined> {
     if (inputIds.length === 0) {
-      return;
+      return undefined;
     }
     const tstart = performance.now();
     this.tvm.beginScope();
@@ -2797,18 +2797,25 @@ export class LLMChatPipeline {
     const chunks: Array<Array<number> | ImageURL>[] = retGetChunks[0];
     const chunkLens: Array<number> = retGetChunks[1];
 
-    for (let i = 0; i < chunks.length; i++) {
-      const chunk = chunks[i];
-      const chunkLen = chunkLens[i];
-      const prevFilledLen = this.filledKVCacheLength;
-      await this.embedAndForward(chunk, chunkLen);
-      if (this.filledKVCacheLength !== prevFilledLen + chunkLen) {
-        throw new Error(
-          "Internal Error: filledKVCacheLength does not match expected value.",
-        );
+    let lastLogits: tvmjs.Tensor | undefined;
+    try {
+      for (let i = 0; i < chunks.length; i++) {
+        const chunk = chunks[i];
+        const chunkLen = chunkLens[i];
+        const prevFilledLen = this.filledKVCacheLength;
+        const logits = await this.embedAndForward(chunk, chunkLen);
+        if (this.filledKVCacheLength !== prevFilledLen + chunkLen) {
+          throw new Error(
+            "Internal Error: filledKVCacheLength does not match expected value.",
+          );
+        }
+        if (i === chunks.length - 1) {
+          lastLogits = this.tvm.detachFromCurrentScope(logits);
+        }
       }
+    } finally {
+      this.tvm.endScope();
     }
-    this.tvm.endScope();
 
     const tend = performance.now();
     if (isPrefill) {
@@ -2817,6 +2824,7 @@ export class LLMChatPipeline {
       this.curRoundPrefillTotalTokens += inputIds.length;
       this.curRoundPrefillTotalTime += (tend - tstart) / 1e3;
     }
+    return lastLogits;
   }
 
   async replayGenerationTokens(
@@ -2824,12 +2832,7 @@ export class LLMChatPipeline {
     assistantPrefixTokenIds: number[],
     generatedTokens: ReplayedGenerationToken[],
     genConfig?: GenerationConfig,
-  ): Promise<void> {
-    if (generatedTokens.length === 0) {
-      throw new Error(
-        "Cannot token-replay a session with no generated tokens.",
-      );
-    }
+  ): Promise<KVCheckpointReplayResult> {
     if (this.resetStatsPerPrefill) {
       this.resetRuntimeStats();
     }
@@ -2843,18 +2846,48 @@ export class LLMChatPipeline {
 
     const grammarMatcherInitPromise =
       this.prepareGrammarMatcherForSampling(genConfig);
-    await this.forwardKnownTokens(promptTokenIds, true);
-    await Promise.all([this.device.sync(), grammarMatcherInitPromise]);
+    const promptLogits = await this.forwardKnownTokens(promptTokenIds, true);
+    try {
+      await Promise.all([this.device.sync(), grammarMatcherInitPromise]);
 
-    this.outputIds.push(...assistantPrefixTokenIds);
-    for (let i = 0; i < generatedTokens.length; i++) {
-      if (i > 0) {
-        const logits = await this.forwardDecodeToken(
-          generatedTokens[i - 1].tokenId,
-        );
-        logits.dispose();
+      this.outputIds.push(...assistantPrefixTokenIds);
+      if (generatedTokens.length === 0) {
+        if (promptLogits === undefined) {
+          throw new Error("Cannot resume from an empty prompt token record.");
+        }
+        const tokenId = await this.sampleFromRawLogits(promptLogits, genConfig);
+        const sampledToken: SampledGenerationStep = {
+          source: "prefill",
+          tokenId,
+          globalTokenPos: promptTokenIds.length,
+        };
+        const committedToken = this.commitSampledStep(sampledToken, genConfig);
+        return {
+          replayedTokens: 0,
+          sampledFromCheckpointLogits: false,
+          sampledToken,
+          committedToken,
+        };
       }
-      this.commitSampledToken(generatedTokens[i].tokenId, genConfig, "decode");
+      for (let i = 0; i < generatedTokens.length; i++) {
+        if (i > 0) {
+          const logits = await this.forwardDecodeToken(
+            generatedTokens[i - 1].tokenId,
+          );
+          logits.dispose();
+        }
+        this.commitSampledToken(
+          generatedTokens[i].tokenId,
+          genConfig,
+          "decode",
+        );
+      }
+      return {
+        replayedTokens: generatedTokens.length,
+        sampledFromCheckpointLogits: false,
+      };
+    } finally {
+      promptLogits?.dispose();
     }
   }
 

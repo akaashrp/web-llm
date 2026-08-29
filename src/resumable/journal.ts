@@ -303,3 +303,26 @@ export async function readJournalRecords(
   }
   return scanJournalRecords(data);
 }
+
+/**
+ * Truncate a torn or corrupt journal tail while retaining every validated
+ * record before it. Callers must hold the session lock while repairing.
+ */
+export async function repairJournalTail(
+  store: OPFSFileStore,
+  path: string,
+): Promise<JournalScanResult> {
+  const data = await store.read(path);
+  if (data === undefined) {
+    return { records: [], validBytes: 0 };
+  }
+  const scan = scanJournalRecords(data);
+  if (scan.stoppedReason === undefined) {
+    return scan;
+  }
+  await store.write(path, data.slice(0, scan.validBytes));
+  return {
+    records: scan.records,
+    validBytes: scan.validBytes,
+  };
+}

@@ -6,6 +6,7 @@ import {
   decodeJournalRecordAt,
   encodeJournalRecord,
   readJournalRecords,
+  repairJournalTail,
   scanJournalRecords,
 } from "../src/resumable/journal";
 import {
@@ -216,6 +217,153 @@ test("journal append and read helpers use OPFS file store", async () => {
     records: [],
     validBytes: 0,
   });
+});
+
+test("journal tail repair truncates bytes after the valid record prefix", async () => {
+  const store = new MemoryFileStore();
+  const valid = encodeJournalRecord(records[0]);
+  await store.write(
+    "journal.bin",
+    concat(valid, new Uint8Array([1, 2, 3]).buffer),
+  );
+
+  const repaired = await repairJournalTail(store, "journal.bin");
+
+  expect(repaired.records).toEqual([records[0]]);
+  expect(repaired.stoppedReason).toBeUndefined();
+  expect((await store.read("journal.bin"))?.byteLength).toBe(valid.byteLength);
+  expect((await readJournalRecords(store, "journal.bin")).records).toEqual([
+    records[0],
+  ]);
+});
+
+test("relaxed token writes serialize before checkpoint commits", async () => {
+  const store = new MemoryFileStore();
+  const originalAppend = store.append.bind(store);
+  let releaseAppend!: () => void;
+  let pauseGeneratedToken = false;
+  store.append = async (path, data) => {
+    const record = decodeJournalRecordAt(bytes(data).buffer).record;
+    if (
+      pauseGeneratedToken &&
+      record.type === JournalRecordType.GeneratedToken
+    ) {
+      await new Promise<void>((resolve) => {
+        releaseAppend = resolve;
+      });
+    }
+    await originalAppend(path, data);
+  };
+  const sessions = new ResumableSessionStore(store, {
+    rootPath: "resume-root",
+  });
+  const journal = new ResumableGenerationJournal(
+    store,
+    sessions,
+    normalizeResumableGenerationConfig({
+      enabled: true,
+      sessionId: "session-relaxed-order",
+      durabilityMode: "relaxed",
+    })!,
+  );
+  await journal.begin({
+    modelId: "model-a",
+    request: { messages: [] },
+    promptTokenIds: [1, 2],
+    assistantPrefixTokenIds: [],
+    generationConfig: {},
+  });
+  pauseGeneratedToken = true;
+  await journal.recordGeneratedToken({
+    globalTokenPos: 2,
+    tokenId: 3,
+    textDelta: "x",
+    textPrefixLength: 0,
+    rngState: 4,
+  });
+
+  let committed = false;
+  const commit = journal
+    .recordCheckpointCommit({
+      checkpointId: "checkpoint_2",
+      processedSeqLen: 2,
+      path: "kv/checkpoint_2",
+    })
+    .then(() => {
+      committed = true;
+    });
+  await Promise.resolve();
+  expect(committed).toBe(false);
+  releaseAppend();
+  await commit;
+
+  const scan = await readJournalRecords(
+    store,
+    "resume-root/sessions/session-relaxed-order/journal.bin",
+  );
+  expect(scan.records.slice(-2).map((record) => record.type)).toEqual([
+    JournalRecordType.GeneratedToken,
+    JournalRecordType.CheckpointCommit,
+  ]);
+  expect(scan.records.slice(-2).map((record) => record.seqNo)).toEqual([4, 5]);
+  await journal.close();
+});
+
+test("relaxed persistence never writes records after an earlier append failure", async () => {
+  const store = new MemoryFileStore();
+  const originalAppend = store.append.bind(store);
+  let failed = false;
+  store.append = async (path, data) => {
+    const journalRecord = decodeJournalRecordAt(bytes(data).buffer).record;
+    if (!failed && journalRecord.type === JournalRecordType.GeneratedToken) {
+      failed = true;
+      throw new Error("token append failed");
+    }
+    await originalAppend(path, data);
+  };
+  const sessions = new ResumableSessionStore(store, {
+    rootPath: "resume-root",
+  });
+  const journal = new ResumableGenerationJournal(
+    store,
+    sessions,
+    normalizeResumableGenerationConfig({
+      enabled: true,
+      sessionId: "session-relaxed-failure",
+      durabilityMode: "relaxed",
+      strictPersistence: false,
+    })!,
+  );
+  await journal.begin({
+    modelId: "model-a",
+    request: { messages: [] },
+    promptTokenIds: [1, 2],
+    assistantPrefixTokenIds: [],
+    generationConfig: {},
+  });
+
+  for (let index = 0; index < 8; index++) {
+    await journal.recordGeneratedToken({
+      globalTokenPos: 2 + index,
+      tokenId: 10 + index,
+      textDelta: String(index),
+      textPrefixLength: index,
+      rngState: index,
+    });
+  }
+  await journal.close();
+
+  const scan = await readJournalRecords(
+    store,
+    "resume-root/sessions/session-relaxed-failure/journal.bin",
+  );
+  expect(failed).toBe(true);
+  expect(
+    scan.records.filter(
+      (journalRecord) =>
+        journalRecord.type === JournalRecordType.GeneratedToken,
+    ),
+  ).toHaveLength(0);
 });
 
 test("text replay applies reversible patches and legacy deltas", () => {

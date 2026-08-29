@@ -31,16 +31,23 @@ export interface InitProgressReport {
 export type InitProgressCallback = (report: InitProgressReport) => void;
 
 export interface ResumableGenerationConfig {
+  /** When false, generation uses the ordinary non-persistent path. */
   enabled: boolean;
   /**
-   * Unique identity for this generation. An existing session must be resumed or
-   * deleted before this identifier can be used for a new generation.
+   * Single-use identity for this generation. Resuming appends to the same
+   * session; delete the persisted session before reusing this identifier for a
+   * new generation. A random identifier is generated when omitted.
    */
   sessionId?: string;
+  /** Decode-token interval between KV checkpoints. Defaults to 512. */
   checkpointIntervalTokens?: number;
+  /** Capture a checkpoint after prompt prefill when supported. Defaults to true. */
   checkpointPrompt?: boolean;
+  /** Exact persists each token before exposure; relaxed batches writes. Defaults to exact. */
   durabilityMode?: "exact" | "relaxed";
+  /** Surface persistence failures instead of continuing best-effort. Defaults to false. */
   strictPersistence?: boolean;
+  /** Store checkpoint logits for recovery before the next token. Defaults to true. */
   storeCheckpointLogits?: boolean;
 }
 

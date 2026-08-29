@@ -310,12 +310,37 @@ jest.mock("../src/llm_chat", () => {
       this.decodeCallCount = Math.max(0, generatedTokens.length - 1);
       this.curRoundDecodingTotalTokens = 0;
       this.curRoundDecodingTotalTime = 0.001;
+      if (generatedTokens.length === 0) {
+        this.message = "first";
+        return {
+          replayedTokens: 0,
+          sampledFromCheckpointLogits: false,
+          sampledToken: {
+            source: "prefill",
+            tokenId: 100,
+            globalTokenPos: promptTokenIds.length,
+          },
+          committedToken: {
+            source: "prefill",
+            tokenId: 100,
+            globalTokenPos: promptTokenIds.length,
+            textDelta: "first",
+            textPrefixLength: 0,
+            outputMessage: "first",
+            stopped: false,
+          },
+        };
+      }
       this.message = generatedTokens.reduce(
         (message, token) =>
           message.slice(0, token.textPrefixLength ?? message.length) +
           token.textDelta,
         "",
       );
+      return {
+        replayedTokens: generatedTokens.length,
+        sampledFromCheckpointLogits: false,
+      };
     }
 
     async replayFromPromptCheckpoint(
@@ -341,6 +366,27 @@ jest.mock("../src/llm_chat", () => {
       this.decodeCallCount = Math.max(0, generatedTokens.length - 1);
       this.curRoundDecodingTotalTokens = 0;
       this.curRoundDecodingTotalTime = 0.001;
+      if (generatedTokens.length === 0) {
+        this.message = "first";
+        return {
+          replayedTokens: 0,
+          sampledFromCheckpointLogits: true,
+          sampledToken: {
+            source: "prefill",
+            tokenId: 100,
+            globalTokenPos: checkpoint.processedSeqLen ?? 0,
+          },
+          committedToken: {
+            source: "prefill",
+            tokenId: 100,
+            globalTokenPos: checkpoint.processedSeqLen ?? 0,
+            textDelta: "first",
+            textPrefixLength: 0,
+            outputMessage: "first",
+            stopped: false,
+          },
+        };
+      }
       this.message = generatedTokens.reduce(
         (message, token) =>
           message.slice(0, token.textPrefixLength ?? message.length) +
@@ -976,6 +1022,40 @@ describe("MLCEngine deterministic integration", () => {
     expect(pipeline.resetCount).toBe(1);
   });
 
+  test("a resumable session persists the complete multi-turn request", async () => {
+    const { engine } = createEngineWithPipeline(1);
+    const files = new MemoryFileStore();
+    attachResumableStore(engine, files);
+    const messages: ChatCompletionRequest["messages"] = [
+      { role: "user", content: "user1" },
+      { role: "assistant", content: "assistant1" },
+      { role: "user", content: "user2" },
+      { role: "assistant", content: "assistant2" },
+      { role: "user", content: "user3" },
+    ];
+
+    await engine.chatCompletion({
+      model: MODEL_ID,
+      messages,
+      extra_body: {
+        resumable: {
+          enabled: true,
+          sessionId: "session-multi-turn",
+        },
+      },
+    });
+
+    const journal = await readSessionJournal(files, "session-multi-turn");
+    expect(journal.records).toContainEqual(
+      expect.objectContaining({
+        type: JournalRecordType.SessionBegin,
+        payload: expect.objectContaining({
+          request: expect.objectContaining({ messages }),
+        }),
+      }),
+    );
+  });
+
   test("exact-mode resumable streaming waits for generated token journal append", async () => {
     const { engine } = createEngineWithPipeline(1);
     const files = new MemoryFileStore();
@@ -1023,6 +1103,366 @@ describe("MLCEngine deterministic integration", () => {
     while (!(await iterator.next()).done) {
       // drain the generator so asyncGenerate releases the model lock
     }
+  });
+
+  test("strictPersistence false falls back after asynchronous storage initialization failure", async () => {
+    const { engine } = createEngineWithPipeline(1);
+    const files = new MemoryFileStore();
+    files.tryLock = jest.fn(async () => {
+      throw new Error("asynchronous OPFS initialization failed");
+    });
+    attachResumableStore(engine, files);
+
+    const response = (await engine.chatCompletion({
+      model: MODEL_ID,
+      messages: [{ role: "user", content: "Storage fallback" }],
+      extra_body: {
+        resumable: {
+          enabled: true,
+          sessionId: "session-storage-fallback",
+          strictPersistence: false,
+        },
+      },
+    })) as ChatCompletion;
+
+    expect(response.choices[0].message.content).toBe(
+      "user:Storage fallback|token1|",
+    );
+  });
+
+  test("strictPersistence false keeps generating after an asynchronous token write failure", async () => {
+    const { engine } = createEngineWithPipeline(1);
+    const files = new MemoryFileStore();
+    const originalAppend = files.append.bind(files);
+    let failedGeneratedTokenWrite = false;
+    files.append = async (path, data) => {
+      const record = decodeJournalRecordAt(bytes(data).buffer).record;
+      if (
+        !failedGeneratedTokenWrite &&
+        record.type === JournalRecordType.GeneratedToken
+      ) {
+        failedGeneratedTokenWrite = true;
+        throw new Error("asynchronous token write failed");
+      }
+      await originalAppend(path, data);
+    };
+    attachResumableStore(engine, files);
+
+    const response = (await engine.chatCompletion({
+      model: MODEL_ID,
+      messages: [{ role: "user", content: "Write fallback" }],
+      extra_body: {
+        resumable: {
+          enabled: true,
+          sessionId: "session-write-fallback",
+          strictPersistence: false,
+        },
+      },
+    })) as ChatCompletion;
+
+    expect(failedGeneratedTokenWrite).toBe(true);
+    expect(response.choices[0].message.content).toBe(
+      "user:Write fallback|token1|",
+    );
+    await expect(engine.listResumableSessions()).resolves.toEqual([
+      expect.objectContaining({
+        sessionId: "session-write-fallback",
+        emittedTokens: 0,
+        recoveryMode: "token_replay",
+      }),
+    ]);
+  });
+
+  test("strictPersistence true surfaces asynchronous storage initialization failure", async () => {
+    const { engine } = createEngineWithPipeline(1);
+    const files = new MemoryFileStore();
+    files.tryLock = jest.fn(async () => {
+      throw new Error("asynchronous OPFS initialization failed");
+    });
+    attachResumableStore(engine, files);
+
+    await expect(
+      engine.chatCompletion({
+        model: MODEL_ID,
+        messages: [{ role: "user", content: "Storage strict" }],
+        extra_body: {
+          resumable: {
+            enabled: true,
+            sessionId: "session-storage-strict",
+            strictPersistence: true,
+          },
+        },
+      }),
+    ).rejects.toThrow("asynchronous OPFS initialization failed");
+  });
+
+  test("strictPersistence true surfaces an asynchronous token write failure", async () => {
+    const { engine } = createEngineWithPipeline(1);
+    const files = new MemoryFileStore();
+    const originalAppend = files.append.bind(files);
+    files.append = async (path, data) => {
+      const record = decodeJournalRecordAt(bytes(data).buffer).record;
+      if (record.type === JournalRecordType.GeneratedToken) {
+        throw new Error("asynchronous token write failed");
+      }
+      await originalAppend(path, data);
+    };
+    attachResumableStore(engine, files);
+
+    await expect(
+      engine.chatCompletion({
+        model: MODEL_ID,
+        messages: [{ role: "user", content: "Write strict" }],
+        extra_body: {
+          resumable: {
+            enabled: true,
+            sessionId: "session-write-strict",
+            strictPersistence: true,
+          },
+        },
+      }),
+    ).rejects.toThrow("asynchronous token write failed");
+  });
+
+  test("stream return records an abort and releases model and session locks", async () => {
+    const { engine } = createEngineWithPipeline(5);
+    const files = new MemoryFileStore();
+    attachResumableStore(engine, files);
+    const iterable = (await engine.chatCompletion({
+      model: MODEL_ID,
+      messages: [{ role: "user", content: "Cancel stream" }],
+      stream: true,
+      extra_body: {
+        resumable: {
+          enabled: true,
+          sessionId: "session-cancel-stream",
+        },
+      },
+    })) as AsyncIterable<ChatCompletionChunk>;
+    const iterator = iterable[Symbol.asyncIterator]();
+
+    await expect(iterator.next()).resolves.toMatchObject({ done: false });
+    await iterator.return!();
+
+    const journal = await readSessionJournal(files, "session-cancel-stream");
+    expect(journal.records.at(-1)?.type).toBe(
+      JournalRecordType.GenerationAborted,
+    );
+    const release = await files.tryLock(
+      "resume-root/sessions/session-cancel-stream/lock",
+    );
+    expect(release).toBeDefined();
+    release!();
+    await expect(
+      engine.chatCompletion({
+        model: MODEL_ID,
+        messages: [{ role: "user", content: "After cancel" }],
+      }),
+    ).resolves.toBeDefined();
+  });
+
+  test("a never-started resumed stream acquires no locks", async () => {
+    const { engine } = createEngineWithPipeline(3);
+    const files = new MemoryFileStore();
+    attachResumableStore(engine, files);
+    const initial = (await engine.chatCompletion({
+      model: MODEL_ID,
+      seed: 7,
+      messages: [{ role: "user", content: "Lazy resume" }],
+      stream: true,
+      extra_body: {
+        resumable: {
+          enabled: true,
+          sessionId: "session-lazy-resume",
+        },
+      },
+    })) as AsyncIterable<ChatCompletionChunk>;
+    const initialIterator = initial[Symbol.asyncIterator]();
+    await initialIterator.next();
+    await initialIterator.return!();
+
+    const resumed = (await engine.resumeChatCompletion("session-lazy-resume", {
+      continueGeneration: true,
+      stream: true,
+    })) as AsyncIterable<ChatCompletionChunk>;
+
+    const neverStartedRelease = await files.tryLock(
+      "resume-root/sessions/session-lazy-resume/lock",
+    );
+    expect(neverStartedRelease).toBeDefined();
+    neverStartedRelease!();
+
+    await resumed[Symbol.asyncIterator]().return!();
+    await expect(
+      engine.resumeChatCompletion("session-lazy-resume", {
+        continueGeneration: true,
+      }),
+    ).resolves.toMatchObject({ recoveryMode: "token_replay" });
+  });
+
+  test("returning a started resumed stream records an abort and releases its locks", async () => {
+    const { engine } = createEngineWithPipeline(5);
+    const files = new MemoryFileStore();
+    attachResumableStore(engine, files);
+    const initial = (await engine.chatCompletion({
+      model: MODEL_ID,
+      seed: 7,
+      messages: [{ role: "user", content: "Cancel resumed stream" }],
+      stream: true,
+      extra_body: {
+        resumable: {
+          enabled: true,
+          sessionId: "session-cancel-resume",
+        },
+      },
+    })) as AsyncIterable<ChatCompletionChunk>;
+    const initialIterator = initial[Symbol.asyncIterator]();
+    await initialIterator.next();
+    await initialIterator.return!();
+
+    const resumed = (await engine.resumeChatCompletion(
+      "session-cancel-resume",
+      { continueGeneration: true, stream: true },
+    )) as AsyncIterable<ChatCompletionChunk>;
+    const resumedIterator = resumed[Symbol.asyncIterator]();
+    await expect(resumedIterator.next()).resolves.toMatchObject({
+      done: false,
+    });
+    await resumedIterator.return!();
+
+    const journal = await readSessionJournal(files, "session-cancel-resume");
+    expect(journal.records.at(-1)?.type).toBe(
+      JournalRecordType.GenerationAborted,
+    );
+    const release = await files.tryLock(
+      "resume-root/sessions/session-cancel-resume/lock",
+    );
+    expect(release).toBeDefined();
+    release!();
+  });
+
+  test("token replay recovers a crash before the first generated token", async () => {
+    const { engine } = createEngineWithPipeline(2);
+    const files = new MemoryFileStore();
+    attachResumableStore(engine, files);
+    injectResumableFaultOnce(
+      "journal.after_append",
+      (context) => context.recordType === JournalRecordType.GenerationConfig,
+    );
+
+    await expect(
+      engine.chatCompletion({
+        model: MODEL_ID,
+        seed: 11,
+        messages: [{ role: "user", content: "Crash before token" }],
+        extra_body: {
+          resumable: {
+            enabled: true,
+            sessionId: "session-zero-token-replay",
+            checkpointPrompt: false,
+            strictPersistence: true,
+          },
+        },
+      }),
+    ).rejects.toThrow("Injected resumable fault");
+    clearResumableFaultHook();
+
+    expect(
+      (await readSessionJournal(files, "session-zero-token-replay")).records,
+    ).not.toContainEqual(
+      expect.objectContaining({ type: JournalRecordType.GeneratedToken }),
+    );
+    await expect(engine.listResumableSessions()).resolves.toEqual([
+      expect.objectContaining({
+        sessionId: "session-zero-token-replay",
+        resumable: true,
+        emittedTokens: 0,
+        recoveryMode: "token_replay",
+      }),
+    ]);
+    await expect(
+      engine.resumeChatCompletion("session-zero-token-replay", {
+        continueGeneration: true,
+      }),
+    ).resolves.toMatchObject({
+      recoveryMode: "token_replay",
+      replayedTokens: 0,
+      recoveredText: "first|token1||token2|",
+      emittedTokens: 3,
+    });
+  });
+
+  test("streamed KV recovery emits the token sampled from checkpoint logits", async () => {
+    const { engine, pipeline } = createEngineWithPipeline(2);
+    pipeline.enablePromptCheckpoint = true;
+    const files = new MemoryFileStore();
+    attachResumableStore(engine, files);
+    injectResumableFaultOnce("checkpoint.after_commit");
+    const initial = (await engine.chatCompletion({
+      model: MODEL_ID,
+      seed: 13,
+      messages: [{ role: "user", content: "Checkpoint first token" }],
+      stream: true,
+      extra_body: {
+        resumable: {
+          enabled: true,
+          sessionId: "session-checkpoint-first-token",
+          strictPersistence: true,
+        },
+      },
+    })) as AsyncIterable<ChatCompletionChunk>;
+    await expect(initial[Symbol.asyncIterator]().next()).rejects.toThrow(
+      "Injected resumable fault",
+    );
+    clearResumableFaultHook();
+
+    const resumed = (await engine.resumeChatCompletion(
+      "session-checkpoint-first-token",
+      { continueGeneration: true, stream: true },
+    )) as AsyncIterable<ChatCompletionChunk>;
+    const iterator = resumed[Symbol.asyncIterator]();
+    const first = await iterator.next();
+    expect(first.value.choices[0].delta?.content).toBe("first");
+    while (!(await iterator.next()).done) {
+      // drain to verify normal completion and cleanup
+    }
+    const generated = (
+      await readSessionJournal(files, "session-checkpoint-first-token")
+    ).records.filter(
+      (record) => record.type === JournalRecordType.GeneratedToken,
+    );
+    expect(generated.map((record) => record.payload.tokenId)).toEqual([
+      100, 101, 102,
+    ]);
+  });
+
+  test("resumable multimodal input is rejected before inference", async () => {
+    const { engine, pipeline } = createEngineWithPipeline(1);
+    (engine as any).loadedModelIdToModelType.set(MODEL_ID, ModelType.VLM);
+    await expect(
+      engine.chatCompletion({
+        model: MODEL_ID,
+        messages: [
+          {
+            role: "user",
+            content: [
+              { type: "text", text: "describe" },
+              {
+                type: "image_url",
+                image_url: { url: "data:image/png;base64,AA==" },
+              },
+            ],
+          },
+        ],
+        extra_body: {
+          resumable: {
+            enabled: true,
+            sessionId: "session-multimodal",
+          },
+        },
+      } as any),
+    ).rejects.toThrow("Resumable generation supports text-only prompts.");
+    expect(pipeline.prefillCallCount).toBe(0);
   });
 
   test("listResumableSessions reports interrupted token replay candidates", async () => {
@@ -1939,84 +2379,68 @@ describe("MLCEngine deterministic integration", () => {
     });
   });
 
-  test("listResumableSessions reports unsupported grammar replay as text-only", async () => {
-    const { engine } = createEngineWithPipeline(5);
+  test("resumable generation rejects grammar before inference", async () => {
+    const { engine, pipeline } = createEngineWithPipeline(5);
     const files = new MemoryFileStore();
     attachResumableStore(engine, files);
-    const iterable = (await engine.chatCompletion({
-      model: MODEL_ID,
-      messages: [{ role: "user", content: "Grammar persist" }],
-      response_format: { type: "json_object" },
-      stream: true,
-      extra_body: {
-        resumable: {
-          enabled: true,
-          sessionId: "session-grammar",
+
+    await expect(
+      engine.chatCompletion({
+        model: MODEL_ID,
+        messages: [{ role: "user", content: "Grammar persist" }],
+        response_format: { type: "json_object" },
+        stream: true,
+        extra_body: {
+          resumable: {
+            enabled: true,
+            sessionId: "session-grammar",
+          },
         },
-      },
-    })) as AsyncIterable<ChatCompletionChunk>;
-    const iterator = iterable[Symbol.asyncIterator]();
-
-    await iterator.next();
-    await engine.interruptGenerate();
-    while (!(await iterator.next()).done) {
-      // drain the generator so asyncGenerate records the abort and releases the lock
-    }
-
-    await expect(engine.listResumableSessions()).resolves.toEqual([
-      expect.objectContaining({
-        sessionId: "session-grammar",
-        resumable: false,
-        recoveryMode: "text_only",
-        reason: "unsupported grammar replay; token replay unavailable",
       }),
-    ]);
+    ).rejects.toThrow(
+      "Resumable generation does not support grammar-constrained response formats.",
+    );
+    expect(pipeline.prefillCallCount).toBe(0);
+    await expect(engine.listResumableSessions()).resolves.toEqual([]);
   });
 
-  test("listResumableSessions reports custom logit processor replay as text-only", async () => {
-    const { engine } = createEngineWithPipeline(5);
+  test("resumable generation rejects custom logit processors before inference", async () => {
+    const { engine, pipeline } = createEngineWithPipeline(5);
     const files = new MemoryFileStore();
     attachResumableStore(engine, files);
-    (engine as any).logitProcessorRegistry = new Map([
-      [
-        MODEL_ID,
-        {
-          processLogits: (logits: Float32Array) => logits,
-          processSampledToken: () => undefined,
-          resetState: () => undefined,
-        },
-      ],
-    ]);
-    const iterable = (await engine.chatCompletion({
-      model: MODEL_ID,
-      messages: [{ role: "user", content: "Processor persist" }],
-      stream: true,
-      extra_body: {
-        resumable: {
-          enabled: true,
-          sessionId: "session-logit-processor",
-        },
-      },
-    })) as AsyncIterable<ChatCompletionChunk>;
-    const iterator = iterable[Symbol.asyncIterator]();
+    engine.setLogitProcessorRegistry(
+      new Map([
+        [
+          MODEL_ID,
+          {
+            processLogits: (logits: Float32Array) => logits,
+            processSampledToken: () => undefined,
+            resetState: () => undefined,
+          },
+        ],
+      ]),
+    );
 
-    await iterator.next();
-    await engine.interruptGenerate();
-    while (!(await iterator.next()).done) {
-      // drain the generator so asyncGenerate records the abort and releases the lock
-    }
-
-    await expect(engine.listResumableSessions()).resolves.toEqual([
-      expect.objectContaining({
-        sessionId: "session-logit-processor",
-        resumable: false,
-        recoveryMode: "text_only",
-        reason: "custom LogitProcessor replay unsupported",
+    await expect(
+      engine.chatCompletion({
+        model: MODEL_ID,
+        messages: [{ role: "user", content: "Processor persist" }],
+        stream: true,
+        extra_body: {
+          resumable: {
+            enabled: true,
+            sessionId: "session-logit-processor",
+          },
+        },
       }),
-    ]);
+    ).rejects.toThrow(
+      "Resumable generation does not support a custom LogitProcessor.",
+    );
+    expect(pipeline.prefillCallCount).toBe(0);
+    await expect(engine.listResumableSessions()).resolves.toEqual([]);
   });
 
-  test("listResumableSessions reports corrupted journals as text-only", async () => {
+  test("listResumableSessions repairs a torn journal tail", async () => {
     const { engine } = createEngineWithPipeline(1);
     const files = new MemoryFileStore();
     attachResumableStore(engine, files);
@@ -2039,11 +2463,18 @@ describe("MLCEngine deterministic integration", () => {
       expect.objectContaining({
         sessionId: "session-corrupt",
         resumable: false,
-        recoveryMode: "text_only",
-        reason:
-          "journal scan stopped at partial_record; token replay unavailable",
+        recoveryMode: "none",
+        reason: "generation finished",
       }),
     ]);
+    expect(
+      (
+        await readJournalRecords(
+          files,
+          "resume-root/sessions/session-corrupt/journal.bin",
+        )
+      ).stoppedReason,
+    ).toBeUndefined();
   });
 
   test("chatCompletion without specifying model when multiple loaded throws error", async () => {

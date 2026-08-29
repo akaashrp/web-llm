@@ -24,6 +24,7 @@ interface JournalSummary {
   aborted: boolean;
   engineErrorMessage?: string;
   hasUnsupportedGrammarReplay: boolean;
+  lastGeneratedTokenHasRngState: boolean;
 }
 
 function none(
@@ -93,6 +94,7 @@ function summarizeJournal(
   let aborted = false;
   let engineErrorMessage: string | undefined;
   let unsupportedGrammarReplay = false;
+  let lastGeneratedTokenHasRngState = false;
 
   for (const record of records) {
     switch (record.type) {
@@ -116,6 +118,7 @@ function summarizeJournal(
         break;
       case JournalRecordType.GeneratedToken:
         emittedTokens++;
+        lastGeneratedTokenHasRngState = record.payload.rngState !== undefined;
         processedSeqLen = Math.max(
           processedSeqLen,
           record.payload.globalTokenPos + 1,
@@ -144,6 +147,7 @@ function summarizeJournal(
     aborted,
     engineErrorMessage,
     hasUnsupportedGrammarReplay: unsupportedGrammarReplay,
+    lastGeneratedTokenHasRngState,
   };
 }
 
@@ -215,6 +219,24 @@ function probeFromScan(
       summary.emittedTokens,
       summary.processedSeqLen,
       "unsupported grammar replay; token replay unavailable",
+    );
+  }
+  if (summary.emittedTokens > 0 && !summary.lastGeneratedTokenHasRngState) {
+    return textOnly(
+      session.sessionId,
+      summary.modelId,
+      summary.emittedTokens,
+      summary.processedSeqLen,
+      "missing RNG state; token replay unavailable",
+    );
+  }
+  if (summary.modelId === "") {
+    return textOnly(
+      session.sessionId,
+      summary.modelId,
+      summary.emittedTokens,
+      summary.processedSeqLen,
+      "missing model id; token replay unavailable",
     );
   }
   if (summary.aborted) {

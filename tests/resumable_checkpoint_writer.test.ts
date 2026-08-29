@@ -142,7 +142,7 @@ function makeStore(): {
   };
 }
 
-test("checkpoint writer commits files, metadata, and journal record", async () => {
+test("checkpoint writer stages complete files before a journal commit", async () => {
   const { files, sessions, writer } = makeStore();
 
   const ref = await writer.writeCheckpoint({
@@ -191,6 +191,19 @@ test("checkpoint writer commits files, metadata, and journal record", async () =
     },
   });
 
+  expect(await sessions.listCommittedCheckpoints("session-a")).toEqual([]);
+  const session = (await sessions.openSession("session-a"))!;
+  await appendJournalRecord(files, session.paths.journalPath, {
+    type: JournalRecordType.CheckpointCommit,
+    seqNo: 1,
+    createdAtMs: 1201,
+    payload: {
+      checkpointId: ref.checkpointId,
+      processedSeqLen: 4,
+      path: ref.path,
+      layoutHash: "layout-a",
+    },
+  });
   expect((await sessions.listCommittedCheckpoints("session-a"))[0]).toEqual(
     ref,
   );

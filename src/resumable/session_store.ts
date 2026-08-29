@@ -19,6 +19,13 @@ const COMPLETE_FILE = "complete";
 const textEncoder = new TextEncoder();
 const textDecoder = new TextDecoder();
 
+export class ResumableSessionExistsError extends Error {
+  constructor(sessionId: string) {
+    super(`Resumable session already exists: ${sessionId}`);
+    this.name = "ResumableSessionExistsError";
+  }
+}
+
 export interface ResumableSessionStoreOptions {
   rootPath?: string;
   now?: () => number;
@@ -151,7 +158,7 @@ export class ResumableSessionStore {
       journalData !== undefined ||
       persistedEntries.length > 0
     ) {
-      throw new Error(`Resumable session already exists: ${sessionId}`);
+      throw new ResumableSessionExistsError(sessionId);
     }
 
     const now = this.now();
@@ -171,7 +178,8 @@ export class ResumableSessionStore {
     const paths = this.getSessionPaths(sessionId);
     const manifest = await this.readManifest(sessionId);
     const entries = await this.files.list(paths.sessionDir);
-    if (manifest === undefined && entries.length === 0) {
+    const persistedEntries = entries.filter((entry) => entry !== LOCK_FILE);
+    if (manifest === undefined && persistedEntries.length === 0) {
       return undefined;
     }
     return { sessionId, paths, manifest };
@@ -193,9 +201,29 @@ export class ResumableSessionStore {
   }
 
   async deleteSession(sessionId: string): Promise<void> {
-    await this.files.remove(this.getSessionPaths(sessionId).sessionDir, {
-      recursive: true,
-    });
+    const paths = this.getSessionPaths(sessionId);
+    const release = await this.files.tryLock(paths.lockPath);
+    if (release === undefined) {
+      throw new Error(`Resumable session is already active: ${sessionId}`);
+    }
+    try {
+      for (const entry of await this.files.list(paths.sessionDir)) {
+        if (entry !== LOCK_FILE) {
+          await this.files.remove(joinPath(paths.sessionDir, entry), {
+            recursive: true,
+          });
+        }
+      }
+      // Web Locks and in-memory stores do not need a lock file, so the empty
+      // directory can be removed while exclusion is still held. A sync-access
+      // lock may keep its file open; in that case the lock-only directory is
+      // intentionally left invisible to openSession().
+      await this.files
+        .remove(paths.sessionDir, { recursive: true })
+        .catch(() => undefined);
+    } finally {
+      release();
+    }
   }
 
   async deleteKV(sessionId: string): Promise<void> {
@@ -252,6 +280,78 @@ export class ResumableSessionStore {
     return refs;
   }
 
+  /** Remove incomplete checkpoints and complete directories lacking a commit. */
+  async reconcileCheckpoints(
+    sessionId: string,
+  ): Promise<ResumableCheckpointRef[]> {
+    const paths = this.getSessionPaths(sessionId);
+    const journal = await readJournalRecords(this.files, paths.journalPath);
+    const committedIds = new Set(
+      journal.records
+        .filter((record) => record.type === JournalRecordType.CheckpointCommit)
+        .map((record) => record.payload.checkpointId),
+    );
+    const removed: ResumableCheckpointRef[] = [];
+    for (const checkpointId of (await this.files.list(paths.kvDir))
+      .filter(isSafeSegment)
+      .sort()) {
+      const ref = this.getCheckpointRef(sessionId, checkpointId);
+      const complete = (await this.files.read(ref.completePath)) !== undefined;
+      if (!complete || !committedIds.has(checkpointId)) {
+        await this.files.remove(ref.path, { recursive: true });
+        removed.push(ref);
+      }
+    }
+    return removed;
+  }
+
+  /** Retain the newest committed checkpoints according to journal order. */
+  async pruneCommittedCheckpoints(
+    sessionId: string,
+    retain = 2,
+  ): Promise<ResumableCheckpointRef[]> {
+    if (!Number.isInteger(retain) || retain < 0) {
+      throw new Error("Checkpoint retention count must be non-negative.");
+    }
+    const paths = this.getSessionPaths(sessionId);
+    const journal = await readJournalRecords(this.files, paths.journalPath);
+    const committedIds: string[] = [];
+    for (const record of journal.records) {
+      if (record.type === JournalRecordType.CheckpointCommit) {
+        const index = committedIds.indexOf(record.payload.checkpointId);
+        if (index !== -1) {
+          committedIds.splice(index, 1);
+        }
+        committedIds.push(record.payload.checkpointId);
+      }
+    }
+    const checkpointIds = (await this.files.list(paths.kvDir))
+      .filter(isSafeSegment)
+      .sort();
+    const availableIds = new Set<string>();
+    for (const checkpointId of checkpointIds) {
+      const ref = this.getCheckpointRef(sessionId, checkpointId);
+      if ((await this.files.read(ref.completePath)) !== undefined) {
+        availableIds.add(checkpointId);
+      }
+    }
+    const availableCommittedIds = committedIds.filter((checkpointId) =>
+      availableIds.has(checkpointId),
+    );
+    const keep = new Set(
+      retain === 0 ? [] : availableCommittedIds.slice(-retain),
+    );
+    const removed: ResumableCheckpointRef[] = [];
+    for (const checkpointId of checkpointIds) {
+      if (!keep.has(checkpointId)) {
+        const ref = this.getCheckpointRef(sessionId, checkpointId);
+        await this.files.remove(ref.path, { recursive: true });
+        removed.push(ref);
+      }
+    }
+    return removed;
+  }
+
   async cleanupIncompleteCheckpoints(
     sessionId?: string,
   ): Promise<ResumableCheckpointRef[]> {
@@ -261,18 +361,7 @@ export class ResumableSessionStore {
         : [sessionId];
     const removed: ResumableCheckpointRef[] = [];
     for (const id of sessionIds) {
-      const checkpointIds = (
-        await this.files.list(this.getSessionPaths(id).kvDir)
-      )
-        .filter(isSafeSegment)
-        .sort();
-      for (const checkpointId of checkpointIds) {
-        const ref = this.getCheckpointRef(id, checkpointId);
-        if ((await this.files.read(ref.completePath)) === undefined) {
-          await this.files.remove(ref.path, { recursive: true });
-          removed.push(ref);
-        }
-      }
+      removed.push(...(await this.reconcileCheckpoints(id)));
     }
     return removed;
   }

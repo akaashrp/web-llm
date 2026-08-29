@@ -1,8 +1,3 @@
-import {
-  JournalRecordType,
-  appendJournalRecord,
-  readJournalRecords,
-} from "./journal";
 import { triggerResumableFault } from "./fault_injection";
 import { OPFSFileStore } from "./opfs_file_store";
 import { ResumableSessionStore } from "./session_store";
@@ -205,7 +200,7 @@ export class ResumableCheckpointWriter {
       );
     }
 
-    const session = await this.sessions.createSession(input.sessionId);
+    await this.sessions.createSession(input.sessionId);
     const ref = this.sessions.getCheckpointRef(
       input.sessionId,
       input.checkpointId,
@@ -276,28 +271,6 @@ export class ResumableCheckpointWriter {
     await this.files.write(joinPath(ref.path, COMPLETE_FILE), encodeText(""));
     await triggerResumableFault("checkpoint.after_complete", faultContext);
 
-    const scan = await readJournalRecords(
-      this.files,
-      session.paths.journalPath,
-    );
-    const seqNo =
-      scan.records.length === 0
-        ? 1
-        : Math.max(...scan.records.map((record) => record.seqNo)) + 1;
-    await triggerResumableFault("checkpoint.before_commit", faultContext);
-    await appendJournalRecord(this.files, session.paths.journalPath, {
-      type: JournalRecordType.CheckpointCommit,
-      seqNo,
-      createdAtMs: this.now(),
-      payload: {
-        checkpointId: input.checkpointId,
-        processedSeqLen: input.processedSeqLen,
-        path: ref.path,
-        layoutHash: input.layoutHash,
-      },
-    });
-    await triggerResumableFault("checkpoint.after_commit", faultContext);
-
     return ref;
   }
 }
@@ -312,7 +285,7 @@ export async function readResumableCheckpointPayload(
   const meta = parseCheckpointMeta(
     await files.read(joinPath(ref.path, META_FILE)),
   );
-  if (meta === undefined) {
+  if (meta === undefined || meta.checkpointId !== ref.checkpointId) {
     return undefined;
   }
 

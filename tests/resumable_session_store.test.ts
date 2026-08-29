@@ -33,6 +33,7 @@ function bytes(data: BufferSource): Uint8Array<ArrayBuffer> {
 class MemoryFileStore implements OPFSFileStore {
   private readonly files = new Map<string, Uint8Array<ArrayBuffer>>();
   private readonly dirs = new Set<string>([""]);
+  private readonly locks = new Set<string>();
 
   async read(path: string): Promise<ArrayBuffer | undefined> {
     const data = this.files.get(normalize(path));
@@ -107,12 +108,21 @@ class MemoryFileStore implements OPFSFileStore {
     }
   }
 
-  async lock(): Promise<() => void> {
-    return () => undefined;
+  async lock(path: string): Promise<() => void> {
+    const release = await this.tryLock(path);
+    if (release === undefined) {
+      throw new Error(`Unable to acquire lock: ${path}`);
+    }
+    return release;
   }
 
-  async tryLock(): Promise<() => void> {
-    return () => undefined;
+  async tryLock(path: string): Promise<(() => void) | undefined> {
+    const normalized = normalize(path);
+    if (this.locks.has(normalized)) {
+      return undefined;
+    }
+    this.locks.add(normalized);
+    return () => this.locks.delete(normalized);
   }
 }
 
@@ -217,7 +227,7 @@ test("rebuild inputs use journal presence and committed checkpoints", async () =
   ]);
 });
 
-test("startup cleanup removes incomplete checkpoints across sessions", async () => {
+test("startup cleanup removes incomplete and complete-uncommitted checkpoints", async () => {
   const { files, sessions } = makeStore();
   await sessions.createSession("session-a");
   await sessions.createSession("session-b");
@@ -233,10 +243,79 @@ test("startup cleanup removes incomplete checkpoints across sessions", async () 
 
   expect(removed.map((item) => `${item.checkpointId}:${item.path}`)).toEqual([
     "checkpoint_drop:resume-root/sessions/session-a/kv/checkpoint_drop",
+    "checkpoint_keep:resume-root/sessions/session-a/kv/checkpoint_keep",
     "checkpoint_drop:resume-root/sessions/session-b/kv/checkpoint_drop",
   ]);
-  expect(await files.list("resume-root/sessions/session-a/kv")).toEqual([
-    "checkpoint_keep",
-  ]);
+  expect(await files.list("resume-root/sessions/session-a/kv")).toEqual([]);
   expect(await files.list("resume-root/sessions/session-b/kv")).toEqual([]);
+});
+
+test("checkpoint pruning retains only the newest two committed directories", async () => {
+  const { files, sessions } = makeStore();
+  const session = await sessions.createSession("session-a");
+  for (let index = 1; index <= 3; index++) {
+    const checkpointId = `checkpoint_${index}`;
+    const ref = sessions.getCheckpointRef("session-a", checkpointId);
+    await files.write(ref.completePath, encoder.encode(""));
+    await appendJournalRecord(files, session.paths.journalPath, {
+      type: JournalRecordType.CheckpointCommit,
+      seqNo: index,
+      createdAtMs: 1000 + index,
+      payload: {
+        checkpointId,
+        processedSeqLen: index,
+        path: ref.path,
+      },
+    });
+  }
+
+  const removed = await sessions.pruneCommittedCheckpoints("session-a", 2);
+
+  expect(removed.map((ref) => ref.checkpointId)).toEqual(["checkpoint_1"]);
+  expect(await files.list(session.paths.kvDir)).toEqual([
+    "checkpoint_2",
+    "checkpoint_3",
+  ]);
+});
+
+test("checkpoint pruning does not count a missing committed directory toward retention", async () => {
+  const { files, sessions } = makeStore();
+  const session = await sessions.createSession("session-a");
+  for (let index = 1; index <= 3; index++) {
+    const checkpointId = `checkpoint_${index}`;
+    const ref = sessions.getCheckpointRef("session-a", checkpointId);
+    if (index < 3) {
+      await files.write(ref.completePath, encoder.encode(""));
+    }
+    await appendJournalRecord(files, session.paths.journalPath, {
+      type: JournalRecordType.CheckpointCommit,
+      seqNo: index,
+      createdAtMs: 1000 + index,
+      payload: {
+        checkpointId,
+        processedSeqLen: index,
+        path: ref.path,
+      },
+    });
+  }
+
+  await sessions.pruneCommittedCheckpoints("session-a", 2);
+
+  expect(await files.list(session.paths.kvDir)).toEqual([
+    "checkpoint_1",
+    "checkpoint_2",
+  ]);
+});
+
+test("session deletion refuses an active session and removes it under lock", async () => {
+  const { files, sessions } = makeStore();
+  const session = await sessions.createSession("session-a");
+  const release = await files.tryLock(session.paths.lockPath);
+
+  await expect(sessions.deleteSession("session-a")).rejects.toThrow(
+    "Resumable session is already active: session-a",
+  );
+  release!();
+  await sessions.deleteSession("session-a");
+  await expect(sessions.openSession("session-a")).resolves.toBeUndefined();
 });

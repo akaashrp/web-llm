@@ -22,6 +22,16 @@ type WritableFileHandle = FileSystemFileHandle & {
 
 const LOCK_POLL_INTERVAL_MS = 25; // OPFS exposes no wait primitive for sync access handle locks
 const processLocks = new Map<string, Promise<void>>();
+const WEB_LOCK_PREFIX = "webllm-resumable:";
+
+export class CrossContextLockUnavailableError extends Error {
+  constructor(path: string) {
+    super(
+      `Cross-context locking is unavailable for resumable storage: ${path}`,
+    );
+    this.name = "CrossContextLockUnavailableError";
+  }
+}
 
 type SyncAccessHandleResult =
   | { state: "acquired"; access: FileSystemSyncAccessHandle }
@@ -107,6 +117,70 @@ async function acquireProcessLock(
       processLocks.delete(key);
     }
   };
+}
+
+type WebLockManager = {
+  request(
+    name: string,
+    options: { mode: "exclusive"; ifAvailable?: boolean },
+    callback: (lock: unknown | null) => Promise<void> | void,
+  ): Promise<void>;
+};
+
+function getWebLockManager(): WebLockManager | undefined {
+  return (globalThis.navigator as { locks?: WebLockManager } | undefined)
+    ?.locks;
+}
+
+async function acquireWebLock(
+  key: string,
+  waitForLock: boolean,
+): Promise<(() => void) | undefined> {
+  const manager = getWebLockManager();
+  if (manager === undefined) {
+    return undefined;
+  }
+  let releaseHold!: () => void;
+  const hold = new Promise<void>((resolve) => {
+    releaseHold = resolve;
+  });
+  let settle!: (release: (() => void) | undefined) => void;
+  let reject!: (err: unknown) => void;
+  let settled = false;
+  const acquired = new Promise<(() => void) | undefined>((resolve, rej) => {
+    settle = resolve;
+    reject = rej;
+  });
+  void manager
+    .request(
+      `${WEB_LOCK_PREFIX}${key}`,
+      {
+        mode: "exclusive",
+        ...(waitForLock ? {} : { ifAvailable: true }),
+      },
+      async (lock) => {
+        if (lock === null) {
+          settled = true;
+          settle(undefined);
+          return;
+        }
+        let released = false;
+        settled = true;
+        settle(() => {
+          if (!released) {
+            released = true;
+            releaseHold();
+          }
+        });
+        await hold;
+      },
+    )
+    .catch((err) => {
+      if (!settled) {
+        reject(err);
+      }
+    });
+  return acquired;
 }
 
 function getNavigatorOPFSRoot(): Promise<FileSystemDirectoryHandle> {
@@ -241,6 +315,22 @@ export class BrowserOPFSFileStore implements OPFSFileStore {
       return undefined;
     }
     try {
+      if (getWebLockManager() !== undefined) {
+        const releaseWebLock = await acquireWebLock(key, waitForLock);
+        if (releaseWebLock === undefined) {
+          releaseProcessLock();
+          return undefined;
+        }
+        let released = false;
+        return () => {
+          if (released) {
+            return;
+          }
+          released = true;
+          releaseWebLock();
+          releaseProcessLock();
+        };
+      }
       const file = await this.getFile(key, true);
       if (file === undefined) {
         throw new Error(`Unable to create OPFS lock file: ${path}`);
@@ -250,8 +340,15 @@ export class BrowserOPFSFileStore implements OPFSFileStore {
         releaseProcessLock();
         return undefined;
       }
-      const access =
-        accessResult.state === "acquired" ? accessResult.access : undefined;
+      if (accessResult.state === "unavailable") {
+        releaseProcessLock();
+        throw new CrossContextLockUnavailableError(path);
+      }
+      if (accessResult.state !== "acquired") {
+        releaseProcessLock();
+        return undefined;
+      }
+      const access = accessResult.access;
       let released = false;
       return () => {
         if (released) {

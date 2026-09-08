@@ -29,6 +29,7 @@ import {
   MessageOrderError,
   TextCompletionExpectsKVEmptyError,
   CannotFindImageEmbedError,
+  GrammarMatcherInitError,
 } from "./error";
 
 type ImageURL = ChatCompletionContentPartImage.ImageURL;
@@ -870,50 +871,64 @@ export class LLMChatPipeline {
     }
 
     // Else dispose current grammarMatcher, reinitialize, and update this.schema.
-    // eslint-disable-next-line no-async-promise-executor
-    return new Promise(async (resolve) => {
+    const initialization = (async () => {
       const tGrammarInitStart = performance.now();
       log.info("Initialize new grammar matcher.");
-      if (this.grammarMatcher) {
-        this.grammarMatcher.dispose();
-      }
-      if (this.xgTokenizerInfo === undefined) {
-        log.info("Initialize token table.");
-        // Post process entire table
-        const rawTokenTable = getTokenTableFromTokenizer(this.tokenizer);
-        this.xgTokenizerInfo = await xgr.TokenizerInfo.createTokenizerInfo(
-          rawTokenTable,
-          this.token_postproc_method,
-          this.prepend_space_in_encode,
-          this.fullVocabSize,
-          this.stopTokens,
-        );
-        this.grammarCompiler = await xgr.GrammarCompiler.createGrammarCompiler(
-          this.xgTokenizerInfo,
-        );
-      }
-      const grammar: xgr.CompiledGrammar =
-        responseFormat.type === undefined
-          ? await this.grammarCompiler!.compileBuiltinJSONGrammar()
-          : responseFormat.type === "json_object"
-            ? await this.grammarCompiler!.compileJSONSchema(
-                responseFormat.schema!,
-              )
-            : responseFormat.type === "grammar"
-              ? await this.grammarCompiler!.compileGrammar(
-                  responseFormat.grammar!,
+      try {
+        if (this.grammarMatcher) {
+          this.grammarMatcher.dispose();
+          this.grammarMatcher = undefined;
+        }
+        if (this.xgTokenizerInfo === undefined) {
+          log.info("Initialize token table.");
+          // Post process entire table
+          const rawTokenTable = getTokenTableFromTokenizer(this.tokenizer);
+          this.xgTokenizerInfo = await xgr.TokenizerInfo.createTokenizerInfo(
+            rawTokenTable,
+            this.token_postproc_method,
+            this.prepend_space_in_encode,
+            this.fullVocabSize,
+            this.stopTokens,
+          );
+          this.grammarCompiler =
+            await xgr.GrammarCompiler.createGrammarCompiler(
+              this.xgTokenizerInfo,
+            );
+        }
+        const grammar: xgr.CompiledGrammar =
+          responseFormat.type === undefined
+            ? await this.grammarCompiler!.compileBuiltinJSONGrammar()
+            : responseFormat.type === "json_object"
+              ? await this.grammarCompiler!.compileJSONSchema(
+                  responseFormat.schema!,
                 )
-              : await this.grammarCompiler!.compileStructuralTag(
-                  responseFormat.structural_tag!,
-                );
-      this.grammarMatcher =
-        await xgr.GrammarMatcher.createGrammarMatcher(grammar);
-      grammar.dispose();
-      this.responseFormatCacheKey = curResponseFormatKey;
-      this.curRoundGrammarInitTotalTime =
-        (performance.now() - tGrammarInitStart) / 1e3;
-      resolve();
-    });
+              : responseFormat.type === "grammar"
+                ? await this.grammarCompiler!.compileGrammar(
+                    responseFormat.grammar!,
+                  )
+                : await this.grammarCompiler!.compileStructuralTag(
+                    responseFormat.structural_tag!,
+                  );
+        try {
+          this.grammarMatcher =
+            await xgr.GrammarMatcher.createGrammarMatcher(grammar);
+        } finally {
+          grammar.dispose();
+        }
+        this.responseFormatCacheKey = curResponseFormatKey;
+        this.curRoundGrammarInitTotalTime =
+          (performance.now() - tGrammarInitStart) / 1e3;
+      } catch (err) {
+        throw new GrammarMatcherInitError(
+          responseFormat.type ?? "json_object",
+          err,
+        );
+      }
+    })();
+    // Observe failures immediately while prefill is still in flight. Awaiting the
+    // original promise below still propagates the initialization error.
+    void initialization.catch(() => undefined);
+    return initialization;
   }
 
   // Getters and setters for this.conversation.
@@ -987,19 +1002,25 @@ export class LLMChatPipeline {
       this.prepareGrammarMatcherForSampling(genConfig);
     const { logits, promptLen, promptTokenIds, assistantPrefixTokenIds } =
       await this.forwardPrefill(inp, msgRole, inp_role_str, genConfig);
-    const promptCheckpoint =
-      opts.capturePromptCheckpoint === true
-        ? await this.tryExportPromptCheckpoint(
-            logits,
-            opts.storeCheckpointLogits !== false,
-          )
-        : undefined;
+    let promptCheckpoint: KVCheckpointData | undefined;
+    let nextToken: number;
+    try {
+      promptCheckpoint =
+        opts.capturePromptCheckpoint === true
+          ? await this.tryExportPromptCheckpoint(
+              logits,
+              opts.storeCheckpointLogits !== false,
+            )
+          : undefined;
 
-    // 4. Sample, stats, post process token sampled.
-    // We wait for prefill and grammar matcher init to finish
-    await Promise.all([this.device.sync(), grammarMatcherInitPromise]);
-    const nextToken = await this.sampleFromRawLogits(logits, genConfig);
-    logits.dispose();
+      // 4. Sample, stats, post process token sampled.
+      // We wait for prefill and grammar matcher init to finish
+      await this.device.sync();
+      await grammarMatcherInitPromise;
+      nextToken = await this.sampleFromRawLogits(logits, genConfig);
+    } finally {
+      logits.dispose();
+    }
     const tend = performance.now();
 
     this.prefillTotalTime += (tend - tstart) / 1e3;
@@ -1200,11 +1221,8 @@ export class LLMChatPipeline {
 
     // Get max_tokens from generationConfig (specified by user in completion request)
     // If not specified, do not set a limit
-    let max_tokens = Infinity;
-    if (genConfig !== undefined && genConfig.max_tokens) {
-      max_tokens = genConfig.max_tokens;
-    }
-    if (max_tokens <= 0) {
+    const max_tokens = genConfig?.max_tokens ?? Infinity;
+    if (!(max_tokens > 0)) {
       throw new MinValueError("max_tokens", 0);
     }
 
@@ -2292,25 +2310,19 @@ export class LLMChatPipeline {
       }
     }
     // Check range validity
-    if (top_p <= 0 || top_p > 1) {
+    if (!(top_p > 0 && top_p <= 1)) {
       throw new RangeError("top_p", 0, 1);
     }
-    if (temperature < 0) {
+    if (!(temperature >= 0)) {
       throw new MinValueError("temperature", 0);
     }
-    if (repetition_penalty <= 0) {
+    if (!(repetition_penalty > 0)) {
       throw new MinValueError("repetition_penalty", 0);
     }
-    if (
-      frequency_penalty &&
-      (frequency_penalty < -2.0 || frequency_penalty > 2.0)
-    ) {
+    if (!(frequency_penalty >= -2.0 && frequency_penalty <= 2.0)) {
       throw new RangeError("frequency_penalty", -2.0, 2.0);
     }
-    if (
-      presence_penalty &&
-      (presence_penalty < -2.0 || presence_penalty > 2.0)
-    ) {
+    if (!(presence_penalty >= -2.0 && presence_penalty <= 2.0)) {
       throw new RangeError("presence_penalty", -2.0, 2.0);
     }
 

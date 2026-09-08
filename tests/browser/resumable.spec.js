@@ -58,3 +58,45 @@ test("LLMChatPipeline retains only final logits while forwarding replay tokens",
     endedScopes: 1,
   });
 });
+
+for (const failure of ["sample", "grammar"]) {
+  test(`prefill releases all tensors after ${failure} failure without unhandled rejections`, async ({
+    page,
+  }) => {
+    const errors = [];
+    page.on("pageerror", (err) => errors.push(err.message));
+    const result = await page.evaluate(
+      (failure) =>
+        globalThis.webllmBrowserHarness.runPrefillFailureRegression(failure),
+      failure,
+    );
+    expect(result.message).toContain(
+      failure === "grammar"
+        ? "Failed to initialize the grammar matcher"
+        : "sampling failed",
+    );
+    expect(result).toMatchObject({ allocated: 5, live: 0, scopes: 0 });
+    expect(errors).toEqual([]);
+  });
+}
+
+test("unused resumable storage observes asynchronous OPFS rejection", async ({
+  page,
+}) => {
+  const errors = [];
+  page.on("pageerror", (err) => errors.push(err.message));
+  const message = await page.evaluate(async () => {
+    const { BrowserOPFSFileStore } = globalThis.webllmBrowserHarness;
+    const store = new BrowserOPFSFileStore(
+      Promise.reject(new Error("OPFS denied")),
+    );
+    await new Promise((resolve) => globalThis.setTimeout(resolve, 10));
+    try {
+      await store.read("journal.bin");
+    } catch (err) {
+      return err.message;
+    }
+  });
+  expect(message).toBe("OPFS denied");
+  expect(errors).toEqual([]);
+});

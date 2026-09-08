@@ -8,7 +8,7 @@ function stubNodePerformanceImport() {
     name: "stub-node-performance-import",
     renderChunk(code) {
       return code.replace(
-        /import (require\$\$\d+) from 'perf_hooks';/g,
+        /import (require\$\$\d+) from '(?:perf_hooks|ws)';/g,
         'const $1 = "MLC_DUMMY_REQUIRE_VAR";',
       );
     },

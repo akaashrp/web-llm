@@ -1,4 +1,6 @@
 import { LLMChatPipeline } from "../../src/llm_chat.ts";
+import { MLCEngine } from "../../src/engine.ts";
+import { prebuiltAppConfig } from "../../src/config.ts";
 import {
   appendJournalRecord,
   readJournalRecords,
@@ -176,7 +178,80 @@ export async function runKnownTokenForwardingRegression() {
 }
 
 globalThis.webllmBrowserHarness = {
+  MLCEngine,
+  prebuiltAppConfig,
+  BrowserOPFSFileStore,
+  LLMChatPipeline,
   runOPFSRegression,
   runFirstTokenReplayRegression,
   runKnownTokenForwardingRegression,
+};
+
+// Only the tensor/forward boundary is simulated. Run the production prefill
+// orchestration and real XGrammar WASM compiler, including asynchronous failure.
+globalThis.webllmBrowserHarness.runPrefillFailureRegression = async (
+  failure,
+) => {
+  const pipeline = Object.create(LLMChatPipeline.prototype);
+  const scopes = [];
+  const live = new Set();
+  let allocated = 0;
+  Object.assign(pipeline, {
+    resetStatsPerPrefill: false,
+    appearedTokensFreq: new Map(),
+    imageDataCache: new Map(),
+    conversation: { isTextCompletion: true },
+    prefillChunkSize: 2,
+    filledKVCacheLength: 0,
+    fullVocabSize: 3,
+    stopTokens: [0],
+    token_postproc_method: "raw",
+    prepend_space_in_encode: false,
+    tokenizer: {
+      getVocabSize: () => 3,
+      idToToken: (id) => ["<eos>", "a", "b"][id],
+    },
+    device: { sync: async () => undefined },
+    tvm: {
+      beginScope: () => scopes.push(new Set()),
+      detachFromCurrentScope: (tensor) => {
+        scopes.at(-1).delete(tensor);
+        return tensor;
+      },
+      endScope: () => {
+        for (const tensor of scopes.pop()) tensor.dispose();
+      },
+    },
+    getInputData: async () => [[Array(10).fill(1)], 10, () => 0],
+    embedAndForward: async (_chunk, length) => {
+      // Let grammar initialization reject while forward work remains pending.
+      await new Promise((resolve) => globalThis.setTimeout(resolve, 10));
+      pipeline.filledKVCacheLength += length;
+      const tensor = { dispose: () => live.delete(tensor) };
+      scopes.at(-1).add(tensor);
+      live.add(tensor);
+      allocated++;
+      return tensor;
+    },
+    sampleFromRawLogits: async () => {
+      throw new Error("sampling failed");
+    },
+  });
+  let message;
+  try {
+    await pipeline.samplePrefillStep(
+      "prompt",
+      "user",
+      undefined,
+      failure === "grammar"
+        ? { response_format: { type: "grammar", grammar: "not a grammar" } }
+        : undefined,
+    );
+  } catch (err) {
+    message = err.message;
+  } finally {
+    pipeline.grammarCompiler?.dispose();
+    pipeline.xgTokenizerInfo?.dispose();
+  }
+  return { message, allocated, live: live.size, scopes: scopes.length };
 };

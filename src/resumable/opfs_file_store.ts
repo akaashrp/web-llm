@@ -219,6 +219,9 @@ export class BrowserOPFSFileStore implements OPFSFileStore {
   ) {
     this.root =
       root === undefined ? getNavigatorOPFSRoot() : Promise.resolve(root);
+    // A streaming request may never be consumed. Observe initialization failure
+    // now; storage operations still receive the original rejection when awaited.
+    void this.root.catch(() => undefined);
   }
 
   async read(path: string): Promise<ArrayBuffer | undefined> {
@@ -250,8 +253,8 @@ export class BrowserOPFSFileStore implements OPFSFileStore {
     if (writable === undefined) {
       throw new Error("OPFS append requires createWritable");
     }
-    const size = (await file.getFile()).size;
     try {
+      const size = (await file.getFile()).size;
       await writable.seek(size);
       await writable.write(data);
     } finally {

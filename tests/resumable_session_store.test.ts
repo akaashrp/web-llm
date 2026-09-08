@@ -4,7 +4,8 @@ import {
   appendJournalRecord,
 } from "../src/resumable/journal";
 import { ResumableSessionStore } from "../src/resumable/session_store";
-import { test, expect } from "@jest/globals";
+import { ResumableCheckpointWriter } from "../src/resumable/checkpoint_writer";
+import { test, expect, jest } from "@jest/globals";
 
 function normalize(path: string): string {
   return path
@@ -256,7 +257,12 @@ test("checkpoint pruning retains only the newest two committed directories", asy
   for (let index = 1; index <= 3; index++) {
     const checkpointId = `checkpoint_${index}`;
     const ref = sessions.getCheckpointRef("session-a", checkpointId);
-    await files.write(ref.completePath, encoder.encode(""));
+    await new ResumableCheckpointWriter(files, sessions).writeCheckpoint({
+      sessionId: "session-a",
+      checkpointId,
+      processedSeqLen: index,
+      pageGroups: [],
+    });
     await appendJournalRecord(files, session.paths.journalPath, {
       type: JournalRecordType.CheckpointCommit,
       seqNo: index,
@@ -285,7 +291,12 @@ test("checkpoint pruning does not count a missing committed directory toward ret
     const checkpointId = `checkpoint_${index}`;
     const ref = sessions.getCheckpointRef("session-a", checkpointId);
     if (index < 3) {
-      await files.write(ref.completePath, encoder.encode(""));
+      await new ResumableCheckpointWriter(files, sessions).writeCheckpoint({
+        sessionId: "session-a",
+        checkpointId,
+        processedSeqLen: index,
+        pageGroups: [],
+      });
     }
     await appendJournalRecord(files, session.paths.journalPath, {
       type: JournalRecordType.CheckpointCommit,
@@ -306,6 +317,71 @@ test("checkpoint pruning does not count a missing committed directory toward ret
     "checkpoint_2",
   ]);
 });
+
+test.each(["crc", "metadata", "missing", "sequence", "io"])(
+  "pruning keeps valid fallbacks when the newest checkpoint has %s damage",
+  async (damage) => {
+    const { files, sessions } = makeStore();
+    const session = await sessions.createSession("session-a");
+    for (let index = 1; index <= 3; index++) {
+      const checkpointId = `checkpoint_${index}`;
+      await new ResumableCheckpointWriter(files, sessions).writeCheckpoint({
+        sessionId: "session-a",
+        checkpointId,
+        processedSeqLen: index,
+        pageGroups: [
+          {
+            groupId: 0,
+            layerStart: 0,
+            layerEnd: 1,
+            fileName: "pages.wkv",
+            data: new Uint8Array([1, 2, 3]),
+          },
+        ],
+      });
+      await appendJournalRecord(files, session.paths.journalPath, {
+        type: JournalRecordType.CheckpointCommit,
+        seqNo: index,
+        createdAtMs: index,
+        payload: { checkpointId, processedSeqLen: index },
+      });
+    }
+    const newest = sessions.getCheckpointRef("session-a", "checkpoint_3");
+    if (damage === "crc")
+      await files.write(`${newest.path}/pages.wkv`, new Uint8Array([3, 2, 1]));
+    if (damage === "metadata")
+      await files.write(`${newest.path}/meta.json`, encoder.encode("{"));
+    if (damage === "missing") await files.remove(`${newest.path}/pages.wkv`);
+    if (damage === "sequence") {
+      const meta = JSON.parse(
+        new TextDecoder().decode(await files.read(`${newest.path}/meta.json`)),
+      );
+      meta.processedSeqLen = 99;
+      await files.write(
+        `${newest.path}/meta.json`,
+        encoder.encode(JSON.stringify(meta)),
+      );
+    }
+    if (damage === "io") {
+      const read = files.read.bind(files);
+      jest.spyOn(files, "read").mockImplementation(async (path) => {
+        if (path === `${newest.path}/pages.wkv`)
+          throw new Error("storage unavailable");
+        return read(path);
+      });
+      await expect(
+        sessions.pruneCommittedCheckpoints("session-a"),
+      ).rejects.toThrow("storage unavailable");
+      expect(await files.list(session.paths.kvDir)).toHaveLength(3);
+    } else {
+      await sessions.pruneCommittedCheckpoints("session-a");
+      expect(await files.list(session.paths.kvDir)).toEqual([
+        "checkpoint_1",
+        "checkpoint_2",
+      ]);
+    }
+  },
+);
 
 test("session deletion refuses an active session and removes it under lock", async () => {
   const { files, sessions } = makeStore();

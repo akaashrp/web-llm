@@ -172,9 +172,7 @@ function summarizeReplayState(
             `Resumable journal session mismatch: expected ${session.sessionId}, got ${record.payload.sessionId}.`,
           );
         }
-        if (modelId === "") {
-          modelId = record.payload.modelId ?? "";
-        }
+        modelId = record.payload.modelId ?? modelId;
         request = record.payload.request;
         break;
       case JournalRecordType.PromptTokens:

@@ -407,6 +407,28 @@ export class ResumableGenerationCoordinator {
     }
   }
 
+  async closeStreamJournal(
+    journal: ResumableGenerationJournal,
+    pipeline: LLMChatPipeline,
+    unfinished: boolean,
+    failure: unknown,
+  ): Promise<void> {
+    try {
+      try {
+        if (unfinished && !isResumableInjectedFault(failure)) {
+          pipeline.triggerStop();
+          await this.finishJournal(journal, "abort");
+        }
+      } finally {
+        await journal.close();
+      }
+    } catch (err) {
+      // Preserve an existing generation error, but report strict persistence
+      // failures from explicit iterator cancellation to its caller.
+      if (failure === undefined) throw err;
+    }
+  }
+
   createResumeCheckpointScheduler(
     journal: ResumableGenerationJournal,
     restored: ResumeContinuationState,
@@ -494,7 +516,12 @@ export class ResumableGenerationCoordinator {
   canAttemptContinuation(state: ResumableReplayState): boolean {
     return (
       state.resumableConfig !== undefined &&
-      this.getTokenReplayBlockReason(state) === undefined
+      // The read-only stream probe sees an un-repaired tail. Actual recovery
+      // truncates it under the session lock, acquired only on first next().
+      this.getTokenReplayBlockReason({
+        ...state,
+        scanStoppedReason: undefined,
+      }) === undefined
     );
   }
 
@@ -869,9 +896,8 @@ export class ResumableGenerationCoordinator {
     try {
       await this.options.getSessionStore().deleteKV(journal.sessionId);
     } catch (err) {
-      if (journal.strictPersistence) {
-        throw err;
-      }
+      // The finished record is durable already. Housekeeping must not turn a
+      // successfully persisted response into a failed, non-resumable request.
       log.warn("KV checkpoint cleanup failed:", err);
     }
   }

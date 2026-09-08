@@ -99,9 +99,7 @@ function summarizeJournal(
   for (const record of records) {
     switch (record.type) {
       case JournalRecordType.SessionBegin:
-        if (modelId === "") {
-          modelId = record.payload.modelId ?? "";
-        }
+        modelId = record.payload.modelId ?? modelId;
         break;
       case JournalRecordType.PromptTokens:
         hasPromptTokens = true;

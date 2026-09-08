@@ -1,6 +1,6 @@
 import { triggerResumableFault } from "./fault_injection";
 import { OPFSFileStore } from "./opfs_file_store";
-import { ResumableSessionStore } from "./session_store";
+import type { ResumableSessionStore } from "./session_store";
 import { ResumableCheckpointRef } from "./types";
 
 type CheckpointByteSource = ArrayBufferLike | ArrayBufferView<ArrayBufferLike>;
@@ -53,6 +53,9 @@ export interface ResumableCheckpointPayload {
   nextLogits?: StoredCheckpointFileMeta & { data: Uint8Array };
 }
 
+/** Invalid stored bytes, as distinct from a transient storage read failure. */
+export class InvalidCheckpointError extends Error {}
+
 const META_FILE = "meta.json";
 const NEXT_LOGITS_FILE = "next_logits.f16";
 const COMPLETE_FILE = "complete";
@@ -101,9 +104,13 @@ function parseCheckpointMeta(
   if (data === undefined) {
     return undefined;
   }
-  const parsed = JSON.parse(
-    textDecoder.decode(data),
-  ) as Partial<StoredResumableCheckpoint>;
+  let parsed: Partial<StoredResumableCheckpoint> | null;
+  try {
+    parsed = JSON.parse(textDecoder.decode(data));
+  } catch {
+    return undefined;
+  }
+  if (parsed === null || typeof parsed !== "object") return undefined;
   const processedSeqLen = parsed.processedSeqLen;
   if (
     typeof parsed.checkpointId !== "string" ||
@@ -111,11 +118,36 @@ function parseCheckpointMeta(
     !Number.isInteger(processedSeqLen) ||
     processedSeqLen < 0 ||
     typeof parsed.createdAtMs !== "number" ||
-    !Array.isArray(parsed.pageGroups)
+    !Array.isArray(parsed.pageGroups) ||
+    !parsed.pageGroups.every(
+      (group) =>
+        isCheckpointFileMeta(group) &&
+        Number.isSafeInteger(group.groupId) &&
+        group.groupId >= 0 &&
+        Number.isSafeInteger(group.layerStart) &&
+        group.layerStart >= 0 &&
+        Number.isSafeInteger(group.layerEnd) &&
+        group.layerEnd >= group.layerStart,
+    ) ||
+    (parsed.nextLogits !== undefined &&
+      !isCheckpointFileMeta(parsed.nextLogits))
   ) {
     return undefined;
   }
   return parsed as StoredResumableCheckpoint;
+}
+
+function isCheckpointFileMeta(meta: CheckpointFileMeta): boolean {
+  return (
+    meta !== null &&
+    typeof meta === "object" &&
+    typeof meta.path === "string" &&
+    isSafeFileName(meta.path) &&
+    Number.isSafeInteger(meta.bytes) &&
+    meta.bytes >= 0 &&
+    typeof meta.crc32c === "string" &&
+    /^[0-9a-f]{8}$/.test(meta.crc32c)
+  );
 }
 
 async function readCheckedFile(
@@ -125,17 +157,19 @@ async function readCheckedFile(
 ): Promise<Uint8Array<ArrayBuffer>> {
   const data = await files.read(joinPath(path, meta.path));
   if (data === undefined) {
-    throw new Error(`Checkpoint file is missing: ${meta.path}`);
+    throw new InvalidCheckpointError(
+      `Checkpoint file is missing: ${meta.path}`,
+    );
   }
   const bytes = new Uint8Array(data);
   if (bytes.byteLength !== meta.bytes) {
-    throw new Error(
+    throw new InvalidCheckpointError(
       `Checkpoint file ${meta.path} size mismatch: expected ${meta.bytes}, got ${bytes.byteLength}.`,
     );
   }
   const actual = crc32cHex(bytes);
   if (actual !== meta.crc32c) {
-    throw new Error(
+    throw new InvalidCheckpointError(
       `Checkpoint file ${meta.path} CRC mismatch: expected ${meta.crc32c}, got ${actual}.`,
     );
   }

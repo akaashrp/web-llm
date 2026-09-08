@@ -218,6 +218,30 @@ test("OPFS file store appends to existing and new files", async () => {
   expect(text(await store.read("new-log.txt"))).toBe("first");
 });
 
+test("append closes its writable when reading the file size fails", async () => {
+  const close = jest.fn(async () => undefined);
+  const store = new BrowserOPFSFileStore({
+    getFileHandle: async () => ({
+      createWritable: async () => ({ close }),
+      getFile: async () => {
+        throw new Error("file size unavailable");
+      },
+    }),
+  } as unknown as FileSystemDirectoryHandle);
+  await expect(
+    store.append("journal.bin", new Uint8Array([1])),
+  ).rejects.toThrow("file size unavailable");
+  expect(close).toHaveBeenCalledTimes(1);
+});
+
+test("an unused store observes root rejection and still reports it on access", async () => {
+  const store = new BrowserOPFSFileStore(
+    Promise.reject(new Error("OPFS denied")),
+  );
+  await tick();
+  await expect(store.read("journal.bin")).rejects.toThrow("OPFS denied");
+});
+
 test("OPFS file store lists, creates, and removes directories", async () => {
   const store = makeStore();
 

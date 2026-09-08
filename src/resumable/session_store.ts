@@ -1,5 +1,14 @@
 import { OPFSFileStore } from "./opfs_file_store";
-import { JournalRecordType, readJournalRecords } from "./journal";
+import log from "loglevel";
+import {
+  CheckpointCommitPayload,
+  JournalRecordType,
+  readJournalRecords,
+} from "./journal";
+import {
+  InvalidCheckpointError,
+  readResumableCheckpointPayload,
+} from "./checkpoint_writer";
 import {
   RESUMABLE_STORE_ROOT,
   ResumableCheckpointRef,
@@ -305,7 +314,7 @@ export class ResumableSessionStore {
     return removed;
   }
 
-  /** Retain the newest committed checkpoints according to journal order. */
+  /** Under the session lock, retain the newest payload-valid committed checkpoints. */
   async pruneCommittedCheckpoints(
     sessionId: string,
     retain = 2,
@@ -315,32 +324,37 @@ export class ResumableSessionStore {
     }
     const paths = this.getSessionPaths(sessionId);
     const journal = await readJournalRecords(this.files, paths.journalPath);
-    const committedIds: string[] = [];
+    const commits = new Map<string, CheckpointCommitPayload>();
     for (const record of journal.records) {
       if (record.type === JournalRecordType.CheckpointCommit) {
-        const index = committedIds.indexOf(record.payload.checkpointId);
-        if (index !== -1) {
-          committedIds.splice(index, 1);
-        }
-        committedIds.push(record.payload.checkpointId);
+        commits.delete(record.payload.checkpointId);
+        commits.set(record.payload.checkpointId, record.payload);
       }
     }
     const checkpointIds = (await this.files.list(paths.kvDir))
       .filter(isSafeSegment)
       .sort();
-    const availableIds = new Set<string>();
-    for (const checkpointId of checkpointIds) {
-      const ref = this.getCheckpointRef(sessionId, checkpointId);
-      if ((await this.files.read(ref.completePath)) !== undefined) {
-        availableIds.add(checkpointId);
+    const keep = new Set<string>();
+    for (const commit of [...commits.values()].reverse()) {
+      if (keep.size === retain) break;
+      if (!checkpointIds.includes(commit.checkpointId)) continue;
+      const ref = this.getCheckpointRef(sessionId, commit.checkpointId);
+      try {
+        const payload = await readResumableCheckpointPayload(this.files, ref);
+        if (
+          payload !== undefined &&
+          payload.meta.processedSeqLen === commit.processedSeqLen &&
+          (commit.layoutHash === undefined ||
+            payload.meta.layoutHash === commit.layoutHash)
+        ) {
+          keep.add(commit.checkpointId);
+        }
+      } catch (err) {
+        // Do not delete checkpoints on a transient I/O failure.
+        if (!(err instanceof InvalidCheckpointError)) throw err;
+        log.warn(`Ignoring invalid KV checkpoint ${commit.checkpointId}:`, err);
       }
     }
-    const availableCommittedIds = committedIds.filter((checkpointId) =>
-      availableIds.has(checkpointId),
-    );
-    const keep = new Set(
-      retain === 0 ? [] : availableCommittedIds.slice(-retain),
-    );
     const removed: ResumableCheckpointRef[] = [];
     for (const checkpointId of checkpointIds) {
       if (!keep.has(checkpointId)) {

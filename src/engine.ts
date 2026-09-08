@@ -99,7 +99,6 @@ import {
   replayPromptSeqLen,
 } from "./resumable/coordinator";
 import { ResumableReplayState } from "./resumable/replay";
-import { isResumableInjectedFault } from "./resumable/fault_injection";
 
 function getUnixTimestampSeconds(): number {
   return Math.floor(Date.now() / 1000);
@@ -392,10 +391,11 @@ export class MLCEngine implements MLCEngineInterface {
     genConfig: GenerationConfig,
   ): Promise<void> {
     const captureCheckpoint =
-      await this.resumableCoordinator.shouldCaptureDecodeCheckpoint(
+      journal.active &&
+      (await this.resumableCoordinator.shouldCaptureDecodeCheckpoint(
         scheduler,
         promptSeqLen + journal.emittedTokenCount,
-      );
+      ));
     const decodeStep = await this.sampleDecode(pipeline, genConfig, {
       captureCheckpoint,
       storeCheckpointLogits: journal.storeCheckpointLogits,
@@ -565,13 +565,12 @@ export class MLCEngine implements MLCEngineInterface {
       throw err;
     } finally {
       try {
-        if (!journalEnded && !isResumableInjectedFault(failure)) {
-          pipeline.triggerStop();
-          await this.resumableCoordinator
-            .finishJournal(journal, "abort")
-            .catch(() => undefined);
-        }
-        await journal.close().catch(() => undefined);
+        await this.resumableCoordinator.closeStreamJournal(
+          journal,
+          pipeline,
+          !journalEnded,
+          failure,
+        );
       } finally {
         await release();
       }
@@ -1356,18 +1355,14 @@ export class MLCEngine implements MLCEngineInterface {
       throw err;
     } finally {
       try {
-        if (
-          journal !== undefined &&
-          journalStarted &&
-          !journalEnded &&
-          !isResumableInjectedFault(failure)
-        ) {
-          pipeline.triggerStop();
-          await this.resumableCoordinator
-            .finishJournal(journal, "abort")
-            .catch(() => undefined);
+        if (journal !== undefined) {
+          await this.resumableCoordinator.closeStreamJournal(
+            journal,
+            pipeline,
+            journalStarted && !journalEnded,
+            failure,
+          );
         }
-        await journal?.close().catch(() => undefined);
       } finally {
         if (lockAcquired) {
           await lock.release();

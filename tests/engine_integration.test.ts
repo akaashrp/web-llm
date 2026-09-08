@@ -1131,7 +1131,8 @@ describe("MLCEngine deterministic integration", () => {
   });
 
   test("strictPersistence false keeps generating after an asynchronous token write failure", async () => {
-    const { engine } = createEngineWithPipeline(1);
+    const { engine, pipeline } = createEngineWithPipeline(3);
+    const sampleDecode = jest.spyOn(pipeline, "sampleDecodeStep");
     const files = new MemoryFileStore();
     const originalAppend = files.append.bind(files);
     let failedGeneratedTokenWrite = false;
@@ -1156,14 +1157,19 @@ describe("MLCEngine deterministic integration", () => {
           enabled: true,
           sessionId: "session-write-fallback",
           strictPersistence: false,
+          checkpointIntervalTokens: 1,
         },
       },
     })) as ChatCompletion;
 
     expect(failedGeneratedTokenWrite).toBe(true);
     expect(response.choices[0].message.content).toBe(
-      "user:Write fallback|token1|",
+      "user:Write fallback|token1||token2||token3|",
     );
+    expect(sampleDecode).toHaveBeenCalled();
+    for (const [, options] of sampleDecode.mock.calls) {
+      expect(options).toMatchObject({ captureCheckpoint: false });
+    }
     await expect(engine.listResumableSessions()).resolves.toEqual([
       expect.objectContaining({
         sessionId: "session-write-fallback",
@@ -1172,6 +1178,49 @@ describe("MLCEngine deterministic integration", () => {
       }),
     ]);
   });
+
+  test.each([false, true])(
+    "finished KV cleanup failure does not discard the response (strict: %s)",
+    async (strictPersistence) => {
+      const { engine, pipeline } = createEngineWithPipeline(1);
+      pipeline.enablePromptCheckpoint = true;
+      const files = new MemoryFileStore();
+      const remove = files.remove.bind(files);
+      files.remove = async (path, options) => {
+        if (path.endsWith("/kv")) throw new Error("cleanup failed");
+        return remove(path, options);
+      };
+      attachResumableStore(engine, files);
+      const warn = jest.spyOn(log, "warn").mockImplementation(() => undefined);
+      try {
+        const response = await engine.chatCompletion({
+          model: MODEL_ID,
+          messages: [{ role: "user", content: "Persist before cleanup" }],
+          extra_body: {
+            resumable: {
+              enabled: true,
+              sessionId: "session-cleanup-failure",
+              strictPersistence,
+            },
+          },
+        });
+        expect(response.choices[0].message.content).toBe(
+          "user:Persist before cleanup|token1|",
+        );
+        const scan = await readSessionJournal(files, "session-cleanup-failure");
+        expect(scan.records.at(-1)?.type).toBe(
+          JournalRecordType.GenerationFinished,
+        );
+        files.remove = remove;
+        await engine.listResumableSessions();
+        expect(
+          await files.list("resume-root/sessions/session-cleanup-failure/kv"),
+        ).toEqual([]);
+      } finally {
+        warn.mockRestore();
+      }
+    },
+  );
 
   test("strictPersistence true surfaces asynchronous storage initialization failure", async () => {
     const { engine } = createEngineWithPipeline(1);
@@ -1261,44 +1310,115 @@ describe("MLCEngine deterministic integration", () => {
     ).resolves.toBeDefined();
   });
 
-  test("a never-started resumed stream acquires no locks", async () => {
-    const { engine } = createEngineWithPipeline(3);
-    const files = new MemoryFileStore();
-    attachResumableStore(engine, files);
-    const initial = (await engine.chatCompletion({
-      model: MODEL_ID,
-      seed: 7,
-      messages: [{ role: "user", content: "Lazy resume" }],
-      stream: true,
-      extra_body: {
-        resumable: {
-          enabled: true,
-          sessionId: "session-lazy-resume",
+  test.each([false, true])(
+    "a never-started resumed stream acquires no locks (torn journal: %s)",
+    async (torn) => {
+      const { engine } = createEngineWithPipeline(3);
+      const files = new MemoryFileStore();
+      attachResumableStore(engine, files);
+      const initial = (await engine.chatCompletion({
+        model: MODEL_ID,
+        seed: 7,
+        messages: [{ role: "user", content: "Lazy resume" }],
+        stream: true,
+        extra_body: {
+          resumable: {
+            enabled: true,
+            sessionId: "session-lazy-resume",
+          },
         },
-      },
-    })) as AsyncIterable<ChatCompletionChunk>;
-    const initialIterator = initial[Symbol.asyncIterator]();
-    await initialIterator.next();
-    await initialIterator.return!();
+      })) as AsyncIterable<ChatCompletionChunk>;
+      const initialIterator = initial[Symbol.asyncIterator]();
+      await initialIterator.next();
+      await initialIterator.return!();
 
-    const resumed = (await engine.resumeChatCompletion("session-lazy-resume", {
-      continueGeneration: true,
-      stream: true,
-    })) as AsyncIterable<ChatCompletionChunk>;
+      if (torn) {
+        await files.append(
+          "resume-root/sessions/session-lazy-resume/journal.bin",
+          new Uint8Array([1, 2, 3]),
+        );
+      }
+      const resumed = (await engine.resumeChatCompletion(
+        "session-lazy-resume",
+        {
+          continueGeneration: true,
+          stream: true,
+        },
+      )) as AsyncIterable<ChatCompletionChunk>;
 
-    const neverStartedRelease = await files.tryLock(
-      "resume-root/sessions/session-lazy-resume/lock",
-    );
-    expect(neverStartedRelease).toBeDefined();
-    neverStartedRelease!();
+      const neverStartedRelease = await files.tryLock(
+        "resume-root/sessions/session-lazy-resume/lock",
+      );
+      expect(neverStartedRelease).toBeDefined();
+      neverStartedRelease!();
 
-    await resumed[Symbol.asyncIterator]().return!();
-    await expect(
-      engine.resumeChatCompletion("session-lazy-resume", {
-        continueGeneration: true,
-      }),
-    ).resolves.toMatchObject({ recoveryMode: "token_replay" });
-  });
+      await resumed[Symbol.asyncIterator]().return!();
+      await expect(
+        engine.resumeChatCompletion("session-lazy-resume", {
+          continueGeneration: true,
+        }),
+      ).resolves.toMatchObject({ recoveryMode: "token_replay" });
+    },
+  );
+
+  test.each([
+    [false, false],
+    [false, true],
+    [true, false],
+    [true, true],
+  ])(
+    "stream cancellation honors persistence strictness (resumed: %s, strict: %s)",
+    async (resumed, strictPersistence) => {
+      const { engine } = createEngineWithPipeline(5);
+      const files = new MemoryFileStore();
+      attachResumableStore(engine, files);
+      const sessionId = "session-cancel-persist-failure";
+      let stream = await engine.chatCompletion({
+        model: MODEL_ID,
+        messages: [{ role: "user", content: "Cancel" }],
+        seed: 7,
+        stream: true,
+        extra_body: {
+          resumable: { enabled: true, sessionId, strictPersistence },
+        },
+      });
+      let iterator = stream[Symbol.asyncIterator]();
+      await iterator.next();
+      if (resumed) {
+        await iterator.return!();
+        stream = (await engine.resumeChatCompletion(sessionId, {
+          continueGeneration: true,
+          stream: true,
+        })) as AsyncIterable<ChatCompletionChunk>;
+        iterator = stream[Symbol.asyncIterator]();
+        await iterator.next();
+      }
+      const append = files.append.bind(files);
+      files.append = async (path, data) => {
+        if (
+          decodeJournalRecordAt(bytes(data).buffer).record.type ===
+          JournalRecordType.GenerationAborted
+        )
+          throw new Error("abort write failed");
+        return append(path, data);
+      };
+      if (strictPersistence)
+        await expect(iterator.return!()).rejects.toThrow("abort write failed");
+      else
+        await expect(iterator.return!()).resolves.toMatchObject({ done: true });
+      const release = await files.tryLock(
+        `resume-root/sessions/${sessionId}/lock`,
+      );
+      expect(release).toBeDefined();
+      release!();
+      await expect(
+        engine.chatCompletion({
+          model: MODEL_ID,
+          messages: [{ role: "user", content: "Next request" }],
+        }),
+      ).resolves.toBeDefined();
+    },
+  );
 
   test("returning a started resumed stream records an abort and releases its locks", async () => {
     const { engine } = createEngineWithPipeline(5);
@@ -1916,10 +2036,7 @@ describe("MLCEngine deterministic integration", () => {
       recoveredText: "user:Corrupt KV|token1||token2||token3|",
     });
     expect(pipeline.promptCheckpointRestoreCount).toBe(0);
-    expect(warn).toHaveBeenCalledWith(
-      `Ignoring invalid KV checkpoint ${checkpoints[0]}:`,
-      expect.any(SyntaxError),
-    );
+    expect(await files.list(kvRoot)).toEqual([]);
     warn.mockRestore();
   });
 

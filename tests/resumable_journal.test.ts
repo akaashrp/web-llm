@@ -18,6 +18,7 @@ import {
   readResumableReplayState,
 } from "../src/resumable/replay";
 import { ResumableSessionStore } from "../src/resumable/session_store";
+import { probeResumableSession } from "../src/resumable/session_probe";
 import { test, expect } from "@jest/globals";
 
 const HEADER_SIZE = 30;
@@ -406,6 +407,24 @@ test("resumable generation journal rejects active writers and session reuse", as
   await expect(second.begin(init)).rejects.toThrow(
     "Resumable session already exists: session-a",
   );
+});
+
+test("the journal model id takes precedence over a stale manifest", async () => {
+  const store = new MemoryFileStore();
+  const sessions = new ResumableSessionStore(store);
+  const session = await sessions.createSession("session-a", {
+    modelId: "stale-model",
+  });
+  await appendJournalRecord(store, session.paths.journalPath, {
+    type: JournalRecordType.SessionBegin,
+    seqNo: 1,
+    createdAtMs: 100,
+    payload: { sessionId: "session-a", modelId: "model-a" },
+  });
+  expect((await readResumableReplayState(store, session)).modelId).toBe(
+    "model-a",
+  );
+  expect((await probeResumableSession(store, session)).modelId).toBe("model-a");
 });
 
 test("replay rejects journals containing multiple session beginnings", async () => {

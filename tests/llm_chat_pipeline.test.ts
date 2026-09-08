@@ -521,6 +521,105 @@ test("known-token forwarding detaches only the final chunk logits", async () => 
   expect(pipeline["tvm"].endScope).toHaveBeenCalled();
 });
 
+test.each([false, true])(
+  "prefill disposes intermediate logits (forward failure: %s)",
+  async (fail) => {
+    const pipeline = preparePrefillPipeline() as any;
+    pipeline["prefillChunkSize"] = 2;
+    pipeline["getInputData"] = jest.fn(async () => [
+      [[1, 2, 3, 4]],
+      4,
+      () => 0,
+    ]);
+    const first = { dispose: jest.fn() };
+    const last = { dispose: jest.fn() };
+    pipeline["embedAndForward"] = jest
+      .fn()
+      .mockImplementationOnce(async () => {
+        pipeline["filledKVCacheLength"] += 2;
+        return first;
+      })
+      .mockImplementationOnce(async () => {
+        if (fail) throw new Error("forward failed");
+        pipeline["filledKVCacheLength"] += 2;
+        return last;
+      });
+
+    const request = pipeline.samplePrefillStep("prompt", Role.user);
+    if (fail) {
+      await expect(request).rejects.toThrow("forward failed");
+    } else {
+      await request;
+      expect(last.dispose).toHaveBeenCalledTimes(1);
+    }
+    expect(pipeline["tvm"].detachFromCurrentScope).not.toHaveBeenCalledWith(
+      first,
+    );
+    expect(pipeline["tvm"].endScope).toHaveBeenCalledTimes(1);
+  },
+);
+
+test("decode releases logits when sampling fails", async () => {
+  const pipeline = createPipeline() as any;
+  const logits = { dispose: jest.fn() };
+  pipeline["outputIds"] = [1];
+  pipeline["embedAndForward"] = jest.fn(async () => {
+    pipeline["filledKVCacheLength"]++;
+    return logits;
+  });
+  pipeline["sampleFromRawLogits"] = jest.fn(async () => {
+    throw new Error("sample failed");
+  });
+  await expect(pipeline.sampleDecodeStep()).rejects.toThrow("sample failed");
+  expect(logits.dispose).toHaveBeenCalledTimes(1);
+});
+
+test("decode closes its scope on forward failure", async () => {
+  const pipeline = createPipeline();
+  pipeline["outputIds"] = [1];
+  pipeline["embedAndForward"] = jest.fn(async () => {
+    throw new Error("forward failed");
+  });
+  await expect(pipeline.sampleDecodeStep()).rejects.toThrow("forward failed");
+  expect(pipeline["tvm"].endScope).toHaveBeenCalledTimes(1);
+});
+
+test.each([false, true])(
+  "checkpoint replay at the context limit preserves all covered tokens (tail: %s)",
+  async (hasTail) => {
+    const pipeline = prepareReplayPipeline() as any;
+    pipeline["conversation"].isTextCompletion = true;
+    pipeline["contextWindowSize"] = 4;
+    pipeline["importPromptCheckpoint"] = jest.fn(async () => {
+      pipeline["filledKVCacheLength"] = 4;
+    });
+    pipeline["tvm"].empty = jest.fn(() => ({ copyFromRawBytes: jest.fn() }));
+    pipeline["sampleFromRawLogits"] = jest.fn(async () => 12);
+    const result = await pipeline.replayFromPromptCheckpoint(
+      {
+        processedSeqLen: 4,
+        metadata: {},
+        pageGroups: [],
+        nextLogits: { shape: [1], dtype: "float32", data: new Uint8Array(4) },
+      },
+      [],
+      [
+        { globalTokenPos: 2, tokenId: 10, textDelta: "t10" },
+        { globalTokenPos: 3, tokenId: 11, textDelta: " t11" },
+      ],
+      hasTail ? [{ globalTokenPos: 4, tokenId: 12, textDelta: " t12" }] : [],
+      { max_tokens: 10 },
+    );
+    expect(pipeline.getMessage()).toBe("t10 t11 t12");
+    expect(pipeline.getFinishReason()).toBe("length");
+    expect(pipeline["filledKVCacheLength"]).toBe(4);
+    expect(result.sampledFromCheckpointLogits).toBe(!hasTail);
+    expect(pipeline["sampleFromRawLogits"]).toHaveBeenCalledTimes(
+      hasTail ? 0 : 1,
+    );
+  },
+);
+
 test("checkpoint replay exposes the token sampled from persisted logits", async () => {
   const pipeline = prepareReplayPipeline();
   const logits = {
@@ -567,6 +666,66 @@ test("checkpoint replay exposes the token sampled from persisted logits", async 
   });
   expect(result.committedToken?.textPrefixLength).toBe(3);
   expect(result.sampledFromCheckpointLogits).toBe(true);
+});
+
+test.each(["copy", "export", "import", "logits replay"])(
+  "checkpoint %s closes its scope when allocation fails",
+  async (operation) => {
+    const pipeline = prepareReplayPipeline() as any;
+    pipeline.kvCache = {};
+    pipeline.kvStateKind = "kv_cache";
+    pipeline.tvm.cpu = jest.fn();
+    pipeline.tvm.empty = jest.fn(() => {
+      throw new Error("allocation failed");
+    });
+    const checkpoint = {
+      processedSeqLen: 4,
+      metadata: {
+        groups: [
+          {
+            group_index: 0,
+            layer_begin: 0,
+            layer_end: 1,
+            shape: [1],
+            dtype: "float32",
+          },
+        ],
+      },
+      pageGroups: [
+        { groupId: 0, layerStart: 0, layerEnd: 1, data: new Uint8Array(4) },
+      ],
+      nextLogits: { shape: [1], dtype: "float32", data: new Uint8Array(4) },
+    };
+    pipeline.getKVCheckpointFunc = jest.fn(
+      () => () => JSON.stringify(checkpoint.metadata),
+    );
+    let promise;
+    if (operation === "copy")
+      promise = pipeline.copyTensorToCPUBytes({ shape: [1], dtype: "float32" });
+    if (operation === "export")
+      promise = pipeline.exportPromptCheckpoint({}, false);
+    if (operation === "import")
+      promise = pipeline.importPromptCheckpoint(checkpoint);
+    if (operation === "logits replay") {
+      pipeline.importPromptCheckpoint = jest.fn(async () => {
+        pipeline.filledKVCacheLength = 4;
+      });
+      promise = pipeline.replayFromPromptCheckpoint(checkpoint, [], [], []);
+    }
+    await expect(promise).rejects.toThrow("allocation failed");
+    expect(pipeline.tvm.beginScope).toHaveBeenCalledTimes(1);
+    expect(pipeline.tvm.endScope).toHaveBeenCalledTimes(1);
+  },
+);
+
+test("KV checkpoint import refuses hybrid state", async () => {
+  const pipeline = createPipeline() as any;
+  pipeline.kvCache = {};
+  pipeline.kvStateKind = "hybrid";
+  await expect(pipeline.importPromptCheckpoint({})).rejects.toThrow(
+    "requires a pure KV cache",
+  );
+  expect(pipeline.tvm.beginScope).not.toHaveBeenCalled();
 });
 
 test("getKVCheckpointFunc uses a scope and caches packed functions", () => {

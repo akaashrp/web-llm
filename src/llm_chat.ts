@@ -1093,21 +1093,25 @@ export class LLMChatPipeline {
     // 2. Prefill each chunk
     this.tvm.beginScope();
     let logits: tvmjs.Tensor | undefined;
-    for (let i = 0; i < chunks.length; i++) {
-      const chunk = chunks[i];
-      const chunkLen = chunkLens[i];
-      const prevFilledLen = this.filledKVCacheLength;
-      logits = this.tvm.detachFromCurrentScope(
-        await this.embedAndForward(chunk, chunkLen),
-      );
-      if (this.filledKVCacheLength !== prevFilledLen + chunkLen) {
-        throw new Error(
-          "Internal Error: filledKVCacheLength does not match expected value.",
-        );
+    try {
+      for (let i = 0; i < chunks.length; i++) {
+        const chunk = chunks[i];
+        const chunkLen = chunkLens[i];
+        const prevFilledLen = this.filledKVCacheLength;
+        const chunkLogits = await this.embedAndForward(chunk, chunkLen);
+        if (this.filledKVCacheLength !== prevFilledLen + chunkLen) {
+          throw new Error(
+            "Internal Error: filledKVCacheLength does not match expected value.",
+          );
+        }
+        if (i === chunks.length - 1) {
+          logits = this.tvm.detachFromCurrentScope(chunkLogits);
+        }
       }
+    } finally {
+      this.imageDataCache.clear();
+      this.tvm.endScope();
     }
-    this.imageDataCache.clear();
-    this.tvm.endScope();
 
     if (logits === undefined) {
       throw new Error("Internal Error: prefill did not produce logits.");
@@ -1127,20 +1131,20 @@ export class LLMChatPipeline {
     }
 
     this.tvm.beginScope();
-    const chunk: Array<Array<number>> = [[tokenId]];
-    const chunkLen = 1;
-    const prevFilledLen = this.filledKVCacheLength;
-    const logits = this.tvm.detachFromCurrentScope(
-      await this.embedAndForward(chunk, chunkLen),
-    );
-    if (this.filledKVCacheLength !== prevFilledLen + chunkLen) {
-      throw new Error(
-        "Internal Error: filledKVCacheLength does not match expected value.",
-      );
+    try {
+      const chunk: Array<Array<number>> = [[tokenId]];
+      const chunkLen = 1;
+      const prevFilledLen = this.filledKVCacheLength;
+      const logits = await this.embedAndForward(chunk, chunkLen);
+      if (this.filledKVCacheLength !== prevFilledLen + chunkLen) {
+        throw new Error(
+          "Internal Error: filledKVCacheLength does not match expected value.",
+        );
+      }
+      return this.tvm.detachFromCurrentScope(logits);
+    } finally {
+      this.tvm.endScope();
     }
-    this.tvm.endScope();
-
-    return logits;
   }
 
   async decodeStep(genConfig?: GenerationConfig): Promise<void> {
@@ -1164,17 +1168,22 @@ export class LLMChatPipeline {
 
     const lastToken = this.outputIds[this.outputIds.length - 1];
     const logits = await this.forwardDecodeToken(lastToken);
-    const decodeCheckpoint =
-      opts.captureCheckpoint === true
-        ? await this.tryExportPromptCheckpoint(
-            logits,
-            opts.storeCheckpointLogits !== false,
-          )
-        : undefined;
+    let decodeCheckpoint: KVCheckpointData | undefined;
+    let nextToken: number;
+    try {
+      decodeCheckpoint =
+        opts.captureCheckpoint === true
+          ? await this.tryExportPromptCheckpoint(
+              logits,
+              opts.storeCheckpointLogits !== false,
+            )
+          : undefined;
 
-    // sample from logits
-    const nextToken = await this.sampleFromRawLogits(logits, genConfig);
-    logits.dispose();
+      // sample from logits
+      nextToken = await this.sampleFromRawLogits(logits, genConfig);
+    } finally {
+      logits.dispose();
+    }
     const tend = performance.now();
 
     this.decodingTotalTime += (tend - tstart) / 1e3;
@@ -1214,6 +1223,7 @@ export class LLMChatPipeline {
   private processNextToken(
     nextToken: number,
     genConfig?: GenerationConfig,
+    processedSeqLen = this.filledKVCacheLength,
   ): void {
     if (this.stopTriggered) {
       throw Error("Cannot call process when it is stoppped");
@@ -1289,7 +1299,7 @@ export class LLMChatPipeline {
     // Stop condition 4: exceed KVCache's context window size
     if (
       this.slidingWindowSize == -1 &&
-      this.filledKVCacheLength == this.contextWindowSize
+      processedSeqLen == this.contextWindowSize
     ) {
       this.stopTriggered = true;
       this.finishReason = "length";
@@ -1407,12 +1417,12 @@ export class LLMChatPipeline {
     tensor: tvmjs.Tensor,
   ): Promise<Uint8Array> {
     this.tvm.beginScope();
-    const cpuTensor = this.tvm.empty(
-      tensor.shape,
-      tensor.dtype,
-      this.tvm.cpu(),
-    );
     try {
+      const cpuTensor = this.tvm.empty(
+        tensor.shape,
+        tensor.dtype,
+        this.tvm.cpu(),
+      );
       cpuTensor.copyFrom(tensor);
       await this.device.sync();
       return this.copyTensorRawBytes(cpuTensor);
@@ -1477,8 +1487,8 @@ export class LLMChatPipeline {
     for (const group of groups) {
       const info = this.checkpointGroupInfo(group);
       this.tvm.beginScope();
-      const dst = this.tvm.empty(info.shape, info.dtype, this.device);
       try {
+        const dst = this.tvm.empty(info.shape, info.dtype, this.device);
         exportPageGroup(
           this.kvCache,
           seqId,
@@ -1519,8 +1529,8 @@ export class LLMChatPipeline {
   private async importPromptCheckpoint(
     checkpoint: KVCheckpointData,
   ): Promise<void> {
-    if (this.kvCache === undefined) {
-      throw new Error("Cannot import KV checkpoint without a KV cache.");
+    if (this.kvCache === undefined || this.kvStateKind !== "kv_cache") {
+      throw new Error("KV checkpoint import requires a pure KV cache.");
     }
     const seqId = new tvmjs.Scalar(0, "int64");
     const prepareImport = this.getKVCheckpointFunc(
@@ -1549,8 +1559,8 @@ export class LLMChatPipeline {
         );
       }
       this.tvm.beginScope();
-      const src = this.tvm.empty(info.shape, info.dtype, this.device);
       try {
+        const src = this.tvm.empty(info.shape, info.dtype, this.device);
         src.copyFromRawBytes(group.data);
         importPageGroup(
           this.kvCache,
@@ -1603,7 +1613,10 @@ export class LLMChatPipeline {
 
     this.outputIds.push(...assistantPrefixTokenIds);
     for (const token of coveredGeneratedTokens) {
-      this.commitSampledToken(token.tokenId, genConfig, "decode");
+      // The imported cache already covers these tokens. Rebuild output and
+      // penalties using each token's original position for the context limit.
+      this.commitSamplerState(token.tokenId, genConfig);
+      this.processNextToken(token.tokenId, genConfig, token.globalTokenPos);
     }
 
     for (let i = 0; i < tailGeneratedTokens.length; i++) {
@@ -1630,12 +1643,12 @@ export class LLMChatPipeline {
       throw new Error("Prompt checkpoint is missing next-token logits.");
     }
     this.tvm.beginScope();
-    const logits = this.tvm.empty(
-      checkpoint.nextLogits.shape,
-      checkpoint.nextLogits.dtype,
-      this.device,
-    );
     try {
+      const logits = this.tvm.empty(
+        checkpoint.nextLogits.shape,
+        checkpoint.nextLogits.dtype,
+        this.device,
+      );
       logits.copyFromRawBytes(checkpoint.nextLogits.data);
       const tokenId = await this.sampleFromRawLogits(logits, genConfig);
       const sampledToken: SampledGenerationStep = {

@@ -14,5 +14,8 @@ export default defineConfig({
   use: {
     baseURL: "http://127.0.0.1:4178",
     browserName: "chromium",
+    launchOptions: {
+      executablePath: globalThis.process.env.WEBLLM_TEST_BROWSER_EXECUTABLE,
+    },
   },
 });

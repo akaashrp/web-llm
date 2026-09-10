@@ -146,6 +146,35 @@ storage for model weights/checkpoints, and a checkpoint-capable
        --headed --grep 'real WebGPU'
 
 It compares uninterrupted seeded output with repeated page-crash recovery,
-with four prior messages, separately forcing token replay and KV
-recovery. Opting in fails, rather than skips, if GPU inference or KV import is
+with four prior messages and a prompt spanning multiple prefill chunks,
+separately forcing token replay and KV recovery. It covers exact/strict and
+relaxed/best-effort persistence, completed-session inspection, ordinary prefix
+reuse after session deletion, and full-history prefill for a new resumable
+session. Opting in fails, rather than skips, if GPU inference or KV import is
 unavailable.
+
+For a locally compiled model library and downloaded model directory:
+
+.. code-block:: bash
+
+   WEBLLM_TEST_MODEL_LIB_PATH=/absolute/path/to/Qwen3-0.6B.wasm \
+   WEBLLM_TEST_MODEL_PATH=/absolute/path/to/Qwen3-0.6B-q4f16_1-MLC \
+   WEBLLM_TEST_BROWSER_EXECUTABLE=/absolute/path/to/chromium \
+     npx playwright test --config tests/browser/playwright.config.mjs
+
+The model directory must contain the matching configuration, tokenizer files,
+tensor-cache manifest, and weight shards. Local files are served over loopback
+HTTP. Do not set both the model-library URL and local-path options.
+
+The browser bundle uses the package-locked runtime by default. To test a TVM
+source build, run ``WEBLLM_TEST_RUNTIME_PATH=/absolute/path/to/tvm/web npm run
+build:browser-tests`` after building that checkout's WASM runtime and JavaScript
+package. Run without this variable to rebuild against the published runtime.
+Record the TVM/MLC-LLM revisions and model-library hash alongside each result.
+
+Each test uses a fresh persistent browser profile, retaining its OPFS contents
+across page reloads. Set ``WEBLLM_TEST_PROFILE_ROOT`` to an existing directory
+on a volume with ample free space if the default temporary volume is nearly
+full; Chromium's blob-storage reserve can reject large cache writes even when
+the model itself would fit. Profiles are removed after each test. These tests
+exercise browser/page recovery, not OS/power-loss durability.

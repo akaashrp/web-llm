@@ -44,6 +44,9 @@ Request and recovery behavior
    * - Another session on the same model
      - Uses a new ID and waits for the current request's model lock. Its prefill
        replaces the in-memory cache; the previous session's persisted data remains.
+       As in ordinary WebLLM, ``interruptGenerate()`` can also abort a queued
+       non-streaming request before prefill; that skipped request creates no session.
+       Explicit iterator ``return()`` does not set this engine-wide interrupt flag.
    * - Reusing a session ID
      - A new request rejects an existing ID, even after completion. Use
        ``resumeChatCompletion`` for continuation, or explicitly delete the session
@@ -94,13 +97,17 @@ exposing it. ``"relaxed"`` queues writes and waits every eight tokens or when
 Neither mode protects against origin eviction, clearing browser data, or all
 OS/power failures.
 
-``strictPersistence: false`` (default) lets generation continue after storage
-failure, without further persistence. ``true`` makes persistence failures reject
+``strictPersistence: false`` (default) lets generation continue after journal
+failure, without further persistence. If only a KV checkpoint write fails, that
+checkpoint is skipped and healthy token journaling can continue.
+``true`` makes persistence failures reject
 generation, including an abort write/flush failure during explicit stream
-cancellation. Unsupported KV export and low quota still permit token journaling;
-strictness does not require KV recovery. Cleanup failure after a durable finished
-record is logged and retried on later session inspection, not treated as a failed
-generation.
+cancellation. Unsupported KV export and a low reported storage estimate skip KV
+capture but still permit token journaling; strictness does not require KV recovery.
+Estimates are advisory: a browser can report headroom while enforcing a lower
+quota. An actual checkpoint write failure follows the same strictness policy.
+Cleanup failure after a durable finished record is logged and retried on later
+session inspection, not treated as a failed generation.
 
 Prompt checkpointing defaults to enabled. Decode checkpoints default to every
 512 tokens, aligned to the cache page size. KV capture is skipped below the
@@ -119,10 +126,11 @@ in-memory conversation prefix; another resumable request always prefills anew.
 Supported scope and validation
 ------------------------------
 
-Supported: text-only chat and text completions with one choice. Resumable
-requests reject images, grammar/JSON/structural-tag constraints, and custom
-LogitProcessors. KV export additionally requires a compatible model library
-containing TVM's checkpoint primitives and a supported pure KV-cache layout.
+Supported: text-only chat completions with one choice. The legacy
+``completions`` endpoint rejects resumability. Resumable chat requests reject
+images, grammar/JSON/structural-tag constraints, and custom LogitProcessors.
+KV export additionally requires a compatible model library containing TVM's
+checkpoint primitives and a supported pure KV-cache layout.
 Unsupported cache layouts use token replay.
 
 Model/tokenizer/weights/configuration fingerprints are not implemented. Keep
@@ -147,11 +155,19 @@ storage for model weights/checkpoints, and a checkpoint-capable
 
 It compares uninterrupted seeded output with repeated page-crash recovery,
 with four prior messages and a prompt spanning multiple prefill chunks,
-separately forcing token replay and KV recovery. It covers exact/strict and
-relaxed/best-effort persistence, completed-session inspection, ordinary prefix
-reuse after session deletion, and full-history prefill for a new resumable
-session. Opting in fails, rather than skips, if GPU inference or KV import is
-unavailable.
+separately forcing token replay and KV recovery. It covers all combinations of
+exact/relaxed durability and strict/best-effort persistence, completed-session
+inspection, ordinary prefix reuse after session deletion, and full-history
+prefill for a new resumable session. Opting in fails, rather than skips, if GPU
+inference or KV import is unavailable.
+
+Additional real-GPU cases cover zero-token recovery at checkpoint write/commit
+boundaries, saved logits present or absent, decode-checkpoint retention and
+corruption, torn journal repair, token-write failures, cancellation, competing
+sessions/tabs, low browser quota, and deliberate browser-process crashes followed
+by relaunching the same profile. Fault hooks pause writes or inject storage
+errors; they do not replace inference. Unsupported requests are checked for
+rejection without creating sessions.
 
 For a locally compiled model library and downloaded model directory:
 
@@ -177,4 +193,4 @@ across page reloads. Set ``WEBLLM_TEST_PROFILE_ROOT`` to an existing directory
 on a volume with ample free space if the default temporary volume is nearly
 full; Chromium's blob-storage reserve can reject large cache writes even when
 the model itself would fit. Profiles are removed after each test. These tests
-exercise browser/page recovery, not OS/power-loss durability.
+exercise browser-process and page recovery, not OS/power-loss durability.

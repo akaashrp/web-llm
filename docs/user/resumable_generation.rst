@@ -192,5 +192,8 @@ Each test uses a fresh persistent browser profile, retaining its OPFS contents
 across page reloads. Set ``WEBLLM_TEST_PROFILE_ROOT`` to an existing directory
 on a volume with ample free space if the default temporary volume is nearly
 full; Chromium's blob-storage reserve can reject large cache writes even when
-the model itself would fit. Profiles are removed after each test. These tests
+the model itself would fit. On macOS, also set ``MAC_CHROMIUM_TMPDIR`` to that
+volume for Chromium's temporary files; ``TMPDIR`` alone does not redirect them.
+Use Playwright's ``--output`` option to move test output if needed.
+Profiles are removed after each test. These tests
 exercise browser-process and page recovery, not OS/power-loss durability.

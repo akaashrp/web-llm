@@ -8,6 +8,8 @@ import {
   JournalRecordType,
 } from "../../src/resumable/journal.ts";
 import { BrowserOPFSFileStore } from "../../src/resumable/opfs_file_store.ts";
+import { ResumableSessionStore } from "../../src/resumable/session_store.ts";
+import { setResumableFaultHook } from "../../src/resumable/fault_injection.ts";
 
 const encoder = new globalThis.TextEncoder();
 const decoder = new globalThis.TextDecoder();
@@ -181,6 +183,10 @@ globalThis.webllmBrowserHarness = {
   MLCEngine,
   prebuiltAppConfig,
   BrowserOPFSFileStore,
+  ResumableSessionStore,
+  readJournalRecords,
+  JournalRecordType,
+  setResumableFaultHook,
   LLMChatPipeline,
   runOPFSRegression,
   runFirstTokenReplayRegression,

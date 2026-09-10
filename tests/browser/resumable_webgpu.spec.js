@@ -1,110 +1,27 @@
-import { expect, test } from "./fixtures.mjs";
+import { expect, test, loadModel, modelId } from "./webgpu.mjs";
 
 // Explicitly opt in: downloads model weights and needs a checkpoint-capable
 // model library, a WebGPU adapter, and shader-f16 support. No mocked inference.
-const modelLib =
-  globalThis.process.env.WEBLLM_TEST_MODEL_LIB ??
-  (globalThis.process.env.WEBLLM_TEST_MODEL_LIB_PATH
-    ? "http://127.0.0.1:4178/model.wasm"
-    : undefined);
-const modelId = "Qwen3-0.6B-q4f16_1-MLC";
-const modelSource = globalThis.process.env.WEBLLM_TEST_MODEL_PATH
-  ? "http://127.0.0.1:4178/model/"
-  : undefined;
-
-if (
-  globalThis.process.env.WEBLLM_TEST_MODEL_LIB &&
-  globalThis.process.env.WEBLLM_TEST_MODEL_LIB_PATH
-) {
-  throw new Error("Set only one model library URL or local path.");
-}
-
-async function loadModel(page) {
-  await page.goto("/");
-  await page.waitForFunction(
-    () => globalThis.webllmBrowserHarness !== undefined,
-  );
-  await page.evaluate(
-    async ({ modelId, modelLib, modelSource }) => {
-      const { MLCEngine, prebuiltAppConfig } = globalThis.webllmBrowserHarness;
-      const model = prebuiltAppConfig.model_list.find(
-        (item) => item.model_id === modelId,
-      );
-      const engine = new MLCEngine({
-        appConfig: {
-          model_list: [
-            {
-              ...model,
-              model: modelSource ?? model.model,
-              model_lib: modelLib,
-            },
-          ],
-        },
-      });
-      await Promise.race([
-        engine.reload(modelId, {
-          context_window_size: 512,
-          prefill_chunk_size: 128,
-        }),
-        globalThis.gpuFailure,
-      ]);
-      globalThis.gpuEngine = engine;
-    },
-    { modelId, modelLib, modelSource },
-  );
-}
-
-for (const durabilityMode of ["exact", "relaxed"]) {
+for (const [durabilityMode, strictPersistence] of [
+  ["exact", true],
+  ["exact", false],
+  ["relaxed", true],
+  ["relaxed", false],
+]) {
   for (const checkpointPrompt of [false, true]) {
-    test(`real WebGPU survives repeated reloads with ${checkpointPrompt ? "KV" : "token"} recovery (${durabilityMode})`, async ({
+    test(`real WebGPU survives repeated reloads with ${checkpointPrompt ? "KV" : "token"} recovery (${durabilityMode}, strict=${strictPersistence})`, async ({
       page,
     }) => {
-      test.skip(
-        !modelLib,
-        "Set WEBLLM_TEST_MODEL_LIB or WEBLLM_TEST_MODEL_LIB_PATH to a checkpoint-capable Qwen3-0.6B WASM",
-      );
-      test.setTimeout(300_000);
-      await page.addInitScript(() => {
-        // Surface the first validation error instead of letting invalid GPU
-        // command buffers accumulate until the browser process crashes.
-        let fail;
-        globalThis.gpuFailure = new Promise((_, reject) => {
-          fail = reject;
-        });
-        void globalThis.gpuFailure.catch(() => undefined);
-        if (globalThis.GPUAdapter === undefined) return;
-        const requestDevice = globalThis.GPUAdapter.prototype.requestDevice;
-        globalThis.GPUAdapter.prototype.requestDevice = async function (
-          ...args
-        ) {
-          const device = await requestDevice.apply(this, args);
-          device.addEventListener(
-            "uncapturederror",
-            (event) => fail(new Error(event.error.message)),
-            { once: true },
-          );
-          return device;
-        };
-      });
-      const pageErrors = [];
-      page.on("pageerror", (err) => pageErrors.push(err.message));
-      page.on("requestfailed", (request) => {
-        const url = new globalThis.URL(request.url());
-        globalThis.console.error(
-          url.origin + url.pathname,
-          request.failure()?.errorText,
-        );
-      });
-      let gpuErrors = 0;
-      page.on("console", (message) => {
-        if (message.type() === "error" && gpuErrors++ < 3) {
-          globalThis.console.error(message.text());
-        }
-      });
       await loadModel(page);
       const sessionId = `browser-gpu-${checkpointPrompt}-${durabilityMode}`;
       const baseline = await page.evaluate(
-        async ({ modelId, checkpointPrompt, sessionId, durabilityMode }) => {
+        async ({
+          modelId,
+          checkpointPrompt,
+          sessionId,
+          durabilityMode,
+          strictPersistence,
+        }) => {
           const request = {
             model: modelId,
             messages: [
@@ -138,7 +55,7 @@ for (const durabilityMode of ["exact", "relaxed"]) {
                 checkpointPrompt,
                 checkpointIntervalTokens: 512,
                 durabilityMode,
-                strictPersistence: durabilityMode === "exact",
+                strictPersistence,
               },
             },
           });
@@ -151,7 +68,13 @@ for (const durabilityMode of ["exact", "relaxed"]) {
             promptTokens: response.usage.prompt_tokens,
           };
         },
-        { modelId, checkpointPrompt, sessionId, durabilityMode },
+        {
+          modelId,
+          checkpointPrompt,
+          sessionId,
+          durabilityMode,
+          strictPersistence,
+        },
       );
       expect(baseline.promptTokens).toBeGreaterThan(128);
 
@@ -237,8 +160,6 @@ for (const durabilityMode of ["exact", "relaxed"]) {
       });
       expect(result.warmPromptTokens).toBeLessThan(result.freshPromptTokens);
       expect(result.freshPromptTokens).toBeGreaterThan(baseline.promptTokens);
-      expect(pageErrors).toEqual([]);
-      expect(gpuErrors).toBe(0);
     });
   }
 }

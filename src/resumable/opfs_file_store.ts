@@ -240,9 +240,12 @@ export class BrowserOPFSFileStore implements OPFSFileStore {
     }
     try {
       await writable.write(data);
-    } finally {
-      await writable.close();
+    } catch (err) {
+      // Abandon partial writes without masking the original storage failure.
+      await writable.abort().catch(() => undefined);
+      throw err;
     }
+    await writable.close();
   }
 
   async append(path: string, data: BufferSource): Promise<void> {
@@ -257,9 +260,11 @@ export class BrowserOPFSFileStore implements OPFSFileStore {
       const size = (await file.getFile()).size;
       await writable.seek(size);
       await writable.write(data);
-    } finally {
-      await writable.close();
+    } catch (err) {
+      await writable.abort().catch(() => undefined);
+      throw err;
     }
+    await writable.close();
   }
 
   async remove(path: string, opts?: { recursive?: boolean }): Promise<void> {

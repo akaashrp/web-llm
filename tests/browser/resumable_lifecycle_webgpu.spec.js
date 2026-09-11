@@ -405,7 +405,7 @@ for (const strictPersistence of [false, true]) {
           });
           return { text: response.choices[0].message.content, writeErrors };
         } catch (err) {
-          return { error: err.message, writeErrors };
+          return { error: err.message, errorName: err.name, writeErrors };
         } finally {
           prototype.write = write;
         }
@@ -418,7 +418,7 @@ for (const strictPersistence of [false, true]) {
       expect.objectContaining({ name: "QuotaExceededError" }),
     );
     if (strictPersistence) {
-      expect(typeof result.error).toBe("string");
+      expect(result.errorName).toBe("QuotaExceededError");
       expect(stored.records.some((record) => record.type === 7)).toBe(false);
     } else {
       expect(result.text).toBe(baseline);

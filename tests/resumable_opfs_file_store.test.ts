@@ -218,11 +218,11 @@ test("OPFS file store appends to existing and new files", async () => {
   expect(text(await store.read("new-log.txt"))).toBe("first");
 });
 
-test("append closes its writable when reading the file size fails", async () => {
-  const close = jest.fn(async () => undefined);
+test("append aborts its writable when reading the file size fails", async () => {
+  const abort = jest.fn(async () => undefined);
   const store = new BrowserOPFSFileStore({
     getFileHandle: async () => ({
-      createWritable: async () => ({ close }),
+      createWritable: async () => ({ abort }),
       getFile: async () => {
         throw new Error("file size unavailable");
       },
@@ -231,8 +231,61 @@ test("append closes its writable when reading the file size fails", async () => 
   await expect(
     store.append("journal.bin", new Uint8Array([1])),
   ).rejects.toThrow("file size unavailable");
-  expect(close).toHaveBeenCalledTimes(1);
+  expect(abort).toHaveBeenCalledTimes(1);
 });
+
+test.each(["write", "append"] as const)(
+  "%s preserves the original write error even if abort fails",
+  async (operation) => {
+    const error = domError("QuotaExceededError");
+    const abort = jest.fn(async () => {
+      throw new Error("stream already errored");
+    });
+    const close = jest.fn(async () => {
+      throw new Error("cannot close errored stream");
+    });
+    const store = new BrowserOPFSFileStore({
+      getFileHandle: async () => ({
+        getFile: async () => ({ size: 0 }),
+        createWritable: async () => ({
+          seek: async () => undefined,
+          write: async () => {
+            throw error;
+          },
+          abort,
+          close,
+        }),
+      }),
+    } as unknown as FileSystemDirectoryHandle);
+    await expect(
+      store[operation]("journal.bin", new Uint8Array([1])),
+    ).rejects.toBe(error);
+    expect(abort).toHaveBeenCalledTimes(1);
+    expect(close).not.toHaveBeenCalled();
+  },
+);
+
+test.each(["write", "append"] as const)(
+  "%s propagates a commit failure from close",
+  async (operation) => {
+    const error = domError("QuotaExceededError");
+    const store = new BrowserOPFSFileStore({
+      getFileHandle: async () => ({
+        getFile: async () => ({ size: 0 }),
+        createWritable: async () => ({
+          seek: async () => undefined,
+          write: async () => undefined,
+          close: async () => {
+            throw error;
+          },
+        }),
+      }),
+    } as unknown as FileSystemDirectoryHandle);
+    await expect(
+      store[operation]("journal.bin", new Uint8Array([1])),
+    ).rejects.toBe(error);
+  },
+);
 
 test("an unused store observes root rejection and still reports it on access", async () => {
   const store = new BrowserOPFSFileStore(

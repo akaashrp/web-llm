@@ -38,11 +38,35 @@ for (const durabilityMode of ["exact", "relaxed"]) {
             }
           })();
           void writing.catch(() => undefined);
+          let previousTokens = 0;
           while (!done) {
             try {
               // No fault injection: exercise the public read-only API concurrently
               // with the production journal writer and actual GPU generation.
-              await globalThis.gpuEngine.resumeChatCompletion(sessionId);
+              const saved =
+                await globalThis.gpuEngine.resumeChatCompletion(sessionId);
+              if (saved.emittedTokens < previousTokens) {
+                throw new Error(
+                  "journal snapshot lost previously persisted tokens",
+                );
+              }
+              previousTokens = saved.emittedTokens;
+              if (reads % 8 === 0) {
+                const sessions =
+                  await globalThis.gpuEngine.listResumableSessions();
+                const listed = sessions.find(
+                  (session) => session.sessionId === sessionId,
+                );
+                if (
+                  !listed ||
+                  listed.emittedTokens < previousTokens ||
+                  listed.reason?.startsWith("session inspection failed:")
+                ) {
+                  throw new Error(
+                    `session listing failed: ${JSON.stringify(listed)}`,
+                  );
+                }
+              }
             } catch (err) {
               errorCount++;
               if (firstErrors.length < 2) {
@@ -52,6 +76,13 @@ for (const durabilityMode of ["exact", "relaxed"]) {
             reads++;
           }
           await writing;
+          const finished =
+            await globalThis.gpuEngine.resumeChatCompletion(sessionId);
+          if (finished.emittedTokens !== request.max_tokens) {
+            throw new Error(
+              `expected ${request.max_tokens} persisted tokens, got ${finished.emittedTokens}`,
+            );
+          }
         }
         return { reads, errorCount, firstErrors };
       },

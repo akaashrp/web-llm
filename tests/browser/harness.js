@@ -11,6 +11,13 @@ import { BrowserOPFSFileStore } from "../../src/resumable/opfs_file_store.ts";
 import { ResumableSessionStore } from "../../src/resumable/session_store.ts";
 import { setResumableFaultHook } from "../../src/resumable/fault_injection.ts";
 
+export {
+  BrowserOPFSFileStore,
+  ResumableSessionStore,
+  appendJournalRecord,
+  readJournalRecords,
+};
+
 const encoder = new globalThis.TextEncoder();
 const decoder = new globalThis.TextDecoder();
 

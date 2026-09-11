@@ -1,4 +1,7 @@
-import { OPFSFileStore } from "./opfs_file_store";
+import {
+  CrossContextLockUnavailableError,
+  OPFSFileStore,
+} from "./opfs_file_store";
 import { triggerResumableFault } from "./fault_injection";
 
 export const JOURNAL_MAGIC = 0x574c4c4a;
@@ -278,6 +281,13 @@ export function scanJournalRecords(data: ArrayBuffer): JournalScanResult {
   return { records, validBytes: offset };
 }
 
+// Separate from the session's generation lock: readers wait only for the
+// current I/O operation, not for generation to finish. The sidecar also supports
+// sync-access locking in workers without Web Locks.
+export function journalLockPath(path: string): string {
+  return `${path}.lock`;
+}
+
 export async function appendJournalRecord(
   store: OPFSFileStore,
   path: string,
@@ -289,7 +299,12 @@ export async function appendJournalRecord(
     seqNo: record.seqNo,
   };
   await triggerResumableFault("journal.before_append", faultContext);
-  await store.append(path, encodeJournalRecord(record));
+  const release = await store.lock(journalLockPath(path));
+  try {
+    await store.append(path, encodeJournalRecord(record));
+  } finally {
+    release();
+  }
   await triggerResumableFault("journal.after_append", faultContext);
 }
 
@@ -297,7 +312,24 @@ export async function readJournalRecords(
   store: OPFSFileStore,
   path: string,
 ): Promise<JournalScanResult> {
-  const data = await store.read(path);
+  let release: (() => void) | undefined;
+  try {
+    release = await store.lock(journalLockPath(path));
+  } catch (err) {
+    // Preserve best-effort text inspection in environments that cannot lock.
+    // Persistence/continuation still require cross-context exclusion.
+    if (!(err instanceof CrossContextLockUnavailableError)) {
+      throw err;
+    }
+  }
+  let data: ArrayBuffer | undefined;
+  try {
+    // File snapshots can become unreadable when a concurrent OPFS writable
+    // commits. Hold exclusion until all snapshot bytes have been materialized.
+    data = await store.read(path);
+  } finally {
+    release?.();
+  }
   if (data === undefined) {
     return { records: [], validBytes: 0 };
   }
@@ -312,17 +344,22 @@ export async function repairJournalTail(
   store: OPFSFileStore,
   path: string,
 ): Promise<JournalScanResult> {
-  const data = await store.read(path);
-  if (data === undefined) {
-    return { records: [], validBytes: 0 };
+  const release = await store.lock(journalLockPath(path));
+  try {
+    const data = await store.read(path);
+    if (data === undefined) {
+      return { records: [], validBytes: 0 };
+    }
+    const scan = scanJournalRecords(data);
+    if (scan.stoppedReason === undefined) {
+      return scan;
+    }
+    await store.write(path, data.slice(0, scan.validBytes));
+    return {
+      records: scan.records,
+      validBytes: scan.validBytes,
+    };
+  } finally {
+    release();
   }
-  const scan = scanJournalRecords(data);
-  if (scan.stoppedReason === undefined) {
-    return scan;
-  }
-  await store.write(path, data.slice(0, scan.validBytes));
-  return {
-    records: scan.records,
-    validBytes: scan.validBytes,
-  };
 }

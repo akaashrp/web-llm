@@ -3,6 +3,7 @@ import log from "loglevel";
 import {
   CheckpointCommitPayload,
   JournalRecordType,
+  journalLockPath,
   readJournalRecords,
 } from "./journal";
 import {
@@ -22,6 +23,7 @@ import {
 const MANIFEST_FILE = "manifest.json";
 const JOURNAL_FILE = "journal.bin";
 const LOCK_FILE = "lock";
+const JOURNAL_LOCK_FILE = journalLockPath(JOURNAL_FILE);
 const KV_DIR = "kv";
 const COMPLETE_FILE = "complete";
 
@@ -161,7 +163,9 @@ export class ResumableSessionStore {
       this.files.read(paths.journalPath),
       this.files.list(paths.sessionDir),
     ]);
-    const persistedEntries = entries.filter((entry) => entry !== LOCK_FILE);
+    const persistedEntries = entries.filter(
+      (entry) => entry !== LOCK_FILE && entry !== JOURNAL_LOCK_FILE,
+    );
     if (
       manifestData !== undefined ||
       journalData !== undefined ||
@@ -187,7 +191,9 @@ export class ResumableSessionStore {
     const paths = this.getSessionPaths(sessionId);
     const manifest = await this.readManifest(sessionId);
     const entries = await this.files.list(paths.sessionDir);
-    const persistedEntries = entries.filter((entry) => entry !== LOCK_FILE);
+    const persistedEntries = entries.filter(
+      (entry) => entry !== LOCK_FILE && entry !== JOURNAL_LOCK_FILE,
+    );
     if (manifest === undefined && persistedEntries.length === 0) {
       return undefined;
     }
@@ -216,20 +222,25 @@ export class ResumableSessionStore {
       throw new Error(`Resumable session is already active: ${sessionId}`);
     }
     try {
-      for (const entry of await this.files.list(paths.sessionDir)) {
-        if (entry !== LOCK_FILE) {
-          await this.files.remove(joinPath(paths.sessionDir, entry), {
-            recursive: true,
-          });
+      const releaseJournal = await this.files.lock(
+        journalLockPath(paths.journalPath),
+      );
+      try {
+        for (const entry of await this.files.list(paths.sessionDir)) {
+          if (entry !== LOCK_FILE && entry !== JOURNAL_LOCK_FILE) {
+            await this.files.remove(joinPath(paths.sessionDir, entry), {
+              recursive: true,
+            });
+          }
         }
+        // Web Locks need no sidecar files. Sync-access handles may leave a
+        // lock-only directory, which remains invisible to openSession().
+        await this.files
+          .remove(paths.sessionDir, { recursive: true })
+          .catch(() => undefined);
+      } finally {
+        releaseJournal();
       }
-      // Web Locks and in-memory stores do not need a lock file, so the empty
-      // directory can be removed while exclusion is still held. A sync-access
-      // lock may keep its file open; in that case the lock-only directory is
-      // intentionally left invisible to openSession().
-      await this.files
-        .remove(paths.sessionDir, { recursive: true })
-        .catch(() => undefined);
     } finally {
       release();
     }

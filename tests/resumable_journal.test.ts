@@ -1,7 +1,11 @@
-import { OPFSFileStore } from "../src/resumable/opfs_file_store";
+import {
+  OPFSFileStore,
+  CrossContextLockUnavailableError,
+} from "../src/resumable/opfs_file_store";
 import {
   JournalRecord,
   JournalRecordType,
+  journalLockPath,
   appendJournalRecord,
   decodeJournalRecordAt,
   encodeJournalRecord,
@@ -19,7 +23,7 @@ import {
 } from "../src/resumable/replay";
 import { ResumableSessionStore } from "../src/resumable/session_store";
 import { probeResumableSession } from "../src/resumable/session_probe";
-import { test, expect } from "@jest/globals";
+import { test, expect, jest } from "@jest/globals";
 
 const HEADER_SIZE = 30;
 
@@ -74,9 +78,10 @@ class MemoryFileStore implements OPFSFileStore {
   async mkdir(): Promise<void> {}
 
   async lock(path: string): Promise<() => void> {
-    const release = await this.tryLock(path);
-    if (release === undefined) {
-      throw new Error(`Unable to acquire lock: ${path}`);
+    let release = await this.tryLock(path);
+    while (release === undefined) {
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      release = await this.tryLock(path);
     }
     return release;
   }
@@ -238,10 +243,90 @@ test("journal tail repair truncates bytes after the valid record prefix", async 
   ]);
 });
 
+test("journal inspection remains available when cross-context locking is unsupported", async () => {
+  const store = new MemoryFileStore();
+  await store.write("journal.bin", encodeJournalRecord(records[0]));
+  jest
+    .spyOn(store, "lock")
+    .mockRejectedValue(
+      new CrossContextLockUnavailableError("journal.bin.lock"),
+    );
+  expect((await readJournalRecords(store, "journal.bin")).records).toEqual([
+    records[0],
+  ]);
+  await expect(
+    appendJournalRecord(store, "journal.bin", records[1]),
+  ).rejects.toBeInstanceOf(CrossContextLockUnavailableError);
+  await expect(repairJournalTail(store, "journal.bin")).rejects.toBeInstanceOf(
+    CrossContextLockUnavailableError,
+  );
+});
+
+test("journal reads hold exclusion until snapshot bytes are materialized", async () => {
+  const store = new MemoryFileStore();
+  const path = "journal.bin";
+  await appendJournalRecord(store, path, records[0]);
+  const read = store.read.bind(store);
+  let finishRead!: () => void;
+  let notifyRead!: () => void;
+  const reading = new Promise<void>((resolve) => {
+    notifyRead = resolve;
+  });
+  store.read = async (path) => {
+    const data = await read(path);
+    await new Promise<void>((resolve) => {
+      finishRead = resolve;
+      notifyRead();
+    });
+    return data;
+  };
+  const snapshot = readJournalRecords(store, path);
+  await reading;
+  expect(await store.tryLock(journalLockPath(path))).toBeUndefined();
+  const append = jest.spyOn(store, "append");
+  const writing = appendJournalRecord(store, path, records[1]);
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  expect(append).not.toHaveBeenCalled();
+  finishRead();
+  expect((await snapshot).records).toEqual([records[0]]);
+  await writing;
+  store.read = read;
+  expect((await readJournalRecords(store, path)).records).toEqual(
+    records.slice(0, 2),
+  );
+});
+
+test.each(["read", "append", "repair"] as const)(
+  "journal %s releases its I/O lock after failure",
+  async (operation) => {
+    const store = new MemoryFileStore();
+    const path = "journal.bin";
+    const error = new Error("storage failure");
+    await store.write(path, new Uint8Array([1]));
+    jest
+      .spyOn(store, operation === "repair" ? "write" : operation)
+      .mockRejectedValueOnce(error);
+    const result =
+      operation === "append"
+        ? appendJournalRecord(store, path, records[0])
+        : operation === "repair"
+          ? repairJournalTail(store, path)
+          : readJournalRecords(store, path);
+    await expect(result).rejects.toBe(error);
+    const release = await store.tryLock(journalLockPath(path));
+    expect(release).toBeDefined();
+    release!();
+  },
+);
+
 test("relaxed token writes serialize before checkpoint commits", async () => {
   const store = new MemoryFileStore();
   const originalAppend = store.append.bind(store);
   let releaseAppend!: () => void;
+  let notifyAppend!: () => void;
+  const appendStarted = new Promise<void>((resolve) => {
+    notifyAppend = resolve;
+  });
   let pauseGeneratedToken = false;
   store.append = async (path, data) => {
     const record = decodeJournalRecordAt(bytes(data).buffer).record;
@@ -251,6 +336,7 @@ test("relaxed token writes serialize before checkpoint commits", async () => {
     ) {
       await new Promise<void>((resolve) => {
         releaseAppend = resolve;
+        notifyAppend();
       });
     }
     await originalAppend(path, data);
@@ -293,7 +379,7 @@ test("relaxed token writes serialize before checkpoint commits", async () => {
     .then(() => {
       committed = true;
     });
-  await Promise.resolve();
+  await appendStarted;
   expect(committed).toBe(false);
   releaseAppend();
   await commit;

@@ -55,6 +55,9 @@ Request and recovery behavior
      - ``resumeChatCompletion(id)`` returns saved text without loading a model or
        generating tokens. It may repair a torn tail and clean checkpoints if it
        can obtain the session lock; an active session is read without mutation.
+       Reads and session listing take a short journal I/O lock, not the lifetime
+       generation lock. Without a supported locking backend, text inspection
+       remains best-effort.
    * - Continued recovery with usable KV
      - Import the newest readable committed checkpoint, rebuild output and
        penalties, and forward only journaled tokens beyond that checkpoint.

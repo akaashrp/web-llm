@@ -180,6 +180,18 @@ test("deleteSession removes journal and kv directories", async () => {
   expect(await sessions.openSession("session-a")).toBeUndefined();
 });
 
+test("journal and generation lock-only directories are invisible and reusable", async () => {
+  const { files, sessions } = makeStore();
+  const paths = sessions.getSessionPaths("lock-only");
+  await files.write(paths.lockPath, new Uint8Array());
+  await files.write(`${paths.journalPath}.lock`, new Uint8Array());
+  expect(await sessions.openSession("lock-only")).toBeUndefined();
+  expect(await sessions.listSessions()).toEqual([]);
+  await expect(sessions.createNewSession("lock-only")).resolves.toMatchObject({
+    sessionId: "lock-only",
+  });
+});
+
 test("manifest helpers read valid manifests and ignore corrupt JSON", async () => {
   const { files, sessions } = makeStore();
   const session = await sessions.createSession("session-a", {

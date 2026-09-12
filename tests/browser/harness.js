@@ -1,5 +1,9 @@
 import { LLMChatPipeline } from "../../src/llm_chat.ts";
 import { MLCEngine } from "../../src/engine.ts";
+export {
+  WebWorkerMLCEngine,
+  WebWorkerMLCEngineHandler,
+} from "../../src/web_worker.ts";
 import { prebuiltAppConfig } from "../../src/config.ts";
 import {
   appendJournalRecord,

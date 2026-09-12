@@ -467,3 +467,89 @@ describe("MLCEngine deterministic integration", () => {
     expect(response.usage?.extra?.prefill_tokens_per_s).toBeGreaterThan(0);
   });
 });
+
+describe("ordinary stream lifecycle", () => {
+  for (const endpoint of ["chat", "completion"] as const) {
+    const start = async (engine: MLCEngine) => {
+      const stream =
+        endpoint === "chat"
+          ? await engine.chatCompletion({
+              model: MODEL_ID,
+              messages: [{ role: "user", content: "Stream" }],
+              stream: true,
+            })
+          : await engine.completion({
+              model: MODEL_ID,
+              prompt: "Stream",
+              stream: true,
+            });
+      return stream[Symbol.asyncIterator]();
+    };
+
+    test(`${endpoint}: unconsumed stream owns no lock, including return before next`, async () => {
+      const { engine } = createEngineWithPipeline(4);
+      const lock = (engine as any).loadedModelIdToLock.get(MODEL_ID);
+      const acquire = jest.spyOn(lock, "acquire");
+      const release = jest.spyOn(lock, "release");
+      const iterator = await start(engine);
+      expect(acquire).not.toHaveBeenCalled();
+      await iterator.return!();
+      expect(acquire).not.toHaveBeenCalled();
+      expect(release).not.toHaveBeenCalled();
+      expect(await iterator.next()).toMatchObject({ done: true });
+    });
+
+    test(`${endpoint}: return releases a started stream exactly once`, async () => {
+      const { engine } = createEngineWithPipeline(4);
+      const lock = (engine as any).loadedModelIdToLock.get(MODEL_ID);
+      const release = jest.spyOn(lock, "release");
+      const iterator = await start(engine);
+      await iterator.next();
+      await iterator.return!();
+      await iterator.return!();
+      expect(release).toHaveBeenCalledTimes(1);
+      const next = await start(engine);
+      expect(await next.next()).toMatchObject({ done: false });
+      await next.return!();
+    });
+
+    for (const stage of ["prefill", "decode"] as const) {
+      test(`${endpoint}: ${stage} failure releases the model lock`, async () => {
+        const { engine } = createEngineWithPipeline(4);
+        const lock = (engine as any).loadedModelIdToLock.get(MODEL_ID);
+        const release = jest.spyOn(lock, "release");
+        const error = new Error("inference failed");
+        const fail = jest
+          .spyOn(engine as any, stage)
+          .mockRejectedValueOnce(error);
+        const iterator = await start(engine);
+        if (stage === "decode") await iterator.next();
+        await expect(iterator.next()).rejects.toBe(error);
+        expect(release).toHaveBeenCalledTimes(1);
+        fail.mockRestore();
+        const next = await start(engine);
+        expect(await next.next()).toMatchObject({ done: false });
+        await next.return!();
+      });
+    }
+
+    test(`${endpoint}: concurrent iterators wait for the active stream`, async () => {
+      const { engine, pipeline } = createEngineWithPipeline(4);
+      const first = await start(engine);
+      const second = await start(engine);
+      await first.next();
+      let secondStarted = false;
+      const pending = second.next().then((value) => {
+        secondStarted = true;
+        return value;
+      });
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      expect(secondStarted).toBe(false);
+      expect(pipeline.prefillCallCount).toBe(1);
+      await first.return!();
+      expect(await pending).toMatchObject({ done: false });
+      expect(pipeline.prefillCallCount).toBe(2);
+      await second.return!();
+    });
+  }
+});

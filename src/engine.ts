@@ -81,6 +81,30 @@ function getUnixTimestampSeconds(): number {
   return Math.floor(Date.now() / 1000);
 }
 
+function countTrailingReplacementChar(value: string): number {
+  let count = 0;
+  for (let i = value.length - 1; i >= 0; i--) {
+    if (value.charAt(i) !== "�") {
+      return count;
+    }
+    count++;
+  }
+  return count;
+}
+
+interface StreamGenerationState {
+  id: string;
+  created: number;
+  prevMessageLength: number;
+}
+
+interface StreamContinuationOptions {
+  emitCurrent?: boolean;
+  skipEmptyDelta?: boolean;
+  completionTokenOffset?: number;
+  beforeFinalChunk?: () => Promise<void>;
+}
+
 /**
  * Creates `MLCEngine`, and loads `modelId` onto WebGPU.
  *
@@ -478,6 +502,239 @@ export class MLCEngine implements MLCEngineInterface {
     return pipeline.getMessage();
   }
 
+  private makeStreamDeltaChunk(
+    request: ChatCompletionRequestStreaming | CompletionCreateParamsStreaming,
+    model: string,
+    pipeline: LLMChatPipeline,
+    state: StreamGenerationState,
+    skipEmptyDelta = false,
+  ): ChatCompletionChunk | Completion | undefined {
+    const curMessage = pipeline.getMessage();
+    if (countTrailingReplacementChar(curMessage) % 4 !== 0) {
+      return undefined;
+    }
+
+    const deltaMessage = curMessage.slice(state.prevMessageLength);
+    state.prevMessageLength = curMessage.length;
+    if (skipEmptyDelta && deltaMessage === "") {
+      return undefined;
+    }
+
+    const logprobs = request.logprobs
+      ? ({
+          content: pipeline.getTokenLogprobArray().slice(-1),
+        } as ChatCompletionChunk.Choice.Logprobs)
+      : null;
+    if ("messages" in request) {
+      return {
+        id: state.id,
+        choices: [
+          {
+            delta: { content: deltaMessage, role: "assistant" },
+            finish_reason: null,
+            index: 0,
+            logprobs,
+          },
+        ],
+        model,
+        object: "chat.completion.chunk",
+        created: state.created,
+      };
+    }
+    return {
+      id: state.id,
+      choices: [
+        {
+          text: deltaMessage,
+          finish_reason: null,
+          index: 0,
+          logprobs,
+        },
+      ],
+      model,
+      object: "text_completion",
+      created: state.created,
+    };
+  }
+
+  private makeStreamFinalChunk(
+    request: ChatCompletionRequestStreaming | CompletionCreateParamsStreaming,
+    model: string,
+    pipeline: LLMChatPipeline,
+    state: StreamGenerationState,
+  ): ChatCompletionChunk | Completion {
+    let finishReason = pipeline.getFinishReason()!;
+    const isChatCompletion = "messages" in request;
+    const isFunctionCalling =
+      isChatCompletion && request.tools !== undefined && request.tools !== null;
+    let toolCalls: Array<ChatCompletionChunk.Choice.Delta.ToolCall> | undefined;
+    if (pipeline.getFinishReason() === "stop" && isFunctionCalling) {
+      finishReason = "tool_calls";
+      toolCalls = getToolCallFromOutputMessage(
+        pipeline.getMessage(),
+        /*isStreaming=*/ true,
+      ) as Array<ChatCompletionChunk.Choice.Delta.ToolCall>;
+    }
+
+    if (isChatCompletion) {
+      return {
+        id: state.id,
+        choices: [
+          {
+            delta: isFunctionCalling
+              ? {
+                  role: "assistant",
+                  tool_calls: toolCalls,
+                }
+              : {},
+            finish_reason: finishReason,
+            index: 0,
+          },
+        ],
+        model,
+        object: "chat.completion.chunk",
+        created: state.created,
+      };
+    }
+    return {
+      id: state.id,
+      choices: [
+        {
+          text: "",
+          finish_reason: finishReason,
+          index: 0,
+        },
+      ],
+      model,
+      object: "text_completion",
+      created: state.created,
+    };
+  }
+
+  private makeStreamUsageChunk(
+    request: ChatCompletionRequestStreaming | CompletionCreateParamsStreaming,
+    model: string,
+    pipeline: LLMChatPipeline,
+    state: StreamGenerationState,
+    completionTokenOffset: number,
+    timeReceived: number,
+  ): ChatCompletionChunk | Completion | undefined {
+    if (request.stream_options?.include_usage !== true) {
+      return undefined;
+    }
+    const usedGrammar =
+      "response_format" in request &&
+      (request.response_format?.type === "grammar" ||
+        request.response_format?.type === "json_object");
+    const completionTokens =
+      pipeline.getCurRoundDecodingTotalTokens() + completionTokenOffset;
+    const promptTokens = pipeline.getCurRoundPrefillTotalTokens();
+    const prefillTime = pipeline.getCurRoundPrefillTotalTime();
+    const decodeTime = pipeline.getCurRoundDecodingTotalTime();
+    const defaultExtra = {
+      e2e_latency_s: (Date.now() - timeReceived) / 1000,
+      prefill_tokens_per_s: pipeline.getCurRoundPrefillTokensPerSec(),
+      decode_tokens_per_s: pipeline.getCurRoundDecodingTokensPerSec(),
+      time_to_first_token_s: prefillTime,
+      time_per_output_token_s: decodeTime / completionTokens,
+      latencyBreakdown: request.extra_body?.enable_latency_breakdown
+        ? pipeline.getCurRoundLatencyBreakdown()
+        : undefined,
+    };
+    const usage: CompletionUsage = {
+      completion_tokens: completionTokens,
+      prompt_tokens: promptTokens,
+      total_tokens: completionTokens + promptTokens,
+      extra: usedGrammar
+        ? {
+            ...defaultExtra,
+            grammar_init_s: pipeline.getCurRoundGrammarInitTotalTime(),
+            grammar_per_token_s:
+              pipeline.getCurRoundGrammarPerTokenTotalTime() / completionTokens,
+          }
+        : defaultExtra,
+    };
+
+    if ("messages" in request) {
+      return {
+        id: state.id,
+        choices: [],
+        usage,
+        model,
+        object: "chat.completion.chunk",
+        created: state.created,
+      };
+    }
+    return {
+      id: state.id,
+      choices: [],
+      usage,
+      model,
+      object: "text_completion",
+      created: state.created,
+    };
+  }
+
+  private async *streamCurrentGeneration(
+    request: ChatCompletionRequestStreaming | CompletionCreateParamsStreaming,
+    model: string,
+    pipeline: LLMChatPipeline,
+    genConfig: GenerationConfig,
+    timeReceived: number,
+    state: StreamGenerationState,
+    decodeStep: () => Promise<void>,
+    opts: StreamContinuationOptions = {},
+  ): AsyncGenerator<ChatCompletionChunk | Completion, void, void> {
+    if (opts.emitCurrent === true) {
+      const chunk = this.makeStreamDeltaChunk(
+        request,
+        model,
+        pipeline,
+        state,
+        opts.skipEmptyDelta,
+      );
+      if (chunk !== undefined) {
+        yield chunk;
+      }
+    }
+
+    while (!pipeline.stopped()) {
+      if (this.interruptSignal) {
+        pipeline.triggerStop();
+        break;
+      }
+      await decodeStep();
+      const chunk = this.makeStreamDeltaChunk(
+        request,
+        model,
+        pipeline,
+        state,
+        opts.skipEmptyDelta,
+      );
+      if (chunk !== undefined) {
+        yield chunk;
+      }
+    }
+
+    if (request.seed !== null && request.seed !== undefined) {
+      pipeline.setSeed(Date.now());
+    }
+    await opts.beforeFinalChunk?.();
+    yield this.makeStreamFinalChunk(request, model, pipeline, state);
+
+    const usageChunk = this.makeStreamUsageChunk(
+      request,
+      model,
+      pipeline,
+      state,
+      opts.completionTokenOffset ?? 0,
+      timeReceived,
+    );
+    if (usageChunk !== undefined) {
+      yield usageChunk;
+    }
+  }
+
   /**
    * Similar to `_generate()`; but instead of using callback, we use an async iterable.
    */
@@ -505,267 +762,40 @@ export class MLCEngine implements MLCEngineInterface {
     genConfig: GenerationConfig,
     timeReceived: number,
   ): AsyncGenerator<ChatCompletionChunk | Completion, void, void> {
-    // Since it is an async generator, we need to do fine-grained try-catch to ensure lock is
-    // released only when errors occur. Then release at the very end when no error occurs.
-    // TODO: This makes code less readable, is there a better way to do this?
+    // Acquire only when iteration starts, and release on completion, failure,
+    // or iterator return. Creating an unconsumed stream owns no model lock.
     const lock = this.loadedModelIdToLock.get(model)!;
-
-    // 0. Pre-processing
-    const isChatCompletion = "messages" in request;
-    const isFunctionCalling =
-      "tools" in request &&
-      request.tools !== undefined &&
-      request.tools !== null;
+    await lock.acquire();
     try {
+      const isChatCompletion = "messages" in request;
+      const isFunctionCalling = "tools" in request && request.tools != null;
       if (isFunctionCalling && !isChatCompletion) {
         throw new Error(
           "Expect `chat.completions` with tools, not `completions`.",
         );
       }
       postInitAndCheckGenerationConfigValues(genConfig);
-      if (request.seed !== null && request.seed !== undefined) {
-        pipeline.setSeed(request.seed);
-      }
-    } catch (err) {
-      await lock.release();
-      throw err;
-    }
-
-    // 1. Helper function that generates the chunk
-    const created = getUnixTimestampSeconds();
-    const id = crypto.randomUUID();
-    this.interruptSignal = false;
-    let prevMessageLength = 0; // to know where to start slicing the delta; does not count �
-
-    function _countTrailingReplacementChar(curMessage: string): number {
-      let cntr = 0;
-      for (let i = curMessage.length - 1; i >= 0; i--) {
-        if (curMessage.charAt(i) === "�") {
-          cntr += 1;
-        } else {
-          return cntr;
-        }
-      }
-      return cntr;
-    }
-
-    async function _getChunk(
-      selectedPipeline: LLMChatPipeline,
-    ): Promise<ChatCompletionChunk | Completion | undefined> {
-      // Remove the replacement character (U+FFFD) from the response to handle emojis.
-      // Each emoji is made up of multiples of 4 tokens; when truncated, it is displayed as �, so
-      // we skip this delta until a full emoji is rendered
-      // TODO(Charlie): This does not consider cases of � not being emoji, need to fix with Streamer
-      const curMessage = selectedPipeline.getMessage();
-      const numTrailingReplacementChar =
-        _countTrailingReplacementChar(curMessage);
-      if (numTrailingReplacementChar % 4 !== 0) {
-        return undefined;
-      }
-
-      const deltaMessage = curMessage.slice(prevMessageLength);
-      prevMessageLength = curMessage.length;
-      const logprobs = request.logprobs
-        ? ({
-            content: selectedPipeline.getTokenLogprobArray().slice(-1), // always the last entry
-          } as ChatCompletionChunk.Choice.Logprobs)
-        : null;
-      if (isChatCompletion) {
-        const chunk: ChatCompletionChunk = {
-          id: id,
-          choices: [
-            {
-              delta: { content: deltaMessage, role: "assistant" },
-              finish_reason: null, // not finished yet
-              index: 0,
-              logprobs: logprobs,
-            },
-          ],
-          model: model,
-          object: "chat.completion.chunk",
-          created: created,
-        };
-        return chunk;
-      } else {
-        const chunk: Completion = {
-          id: id,
-          choices: [
-            {
-              text: deltaMessage,
-              finish_reason: null, // not finished yet
-              index: 0,
-              logprobs: logprobs,
-            },
-          ],
-          model: model,
-          object: "text_completion",
-          created: created,
-        };
-        return chunk;
-      }
-    }
-
-    // 2. Auto-regressive loop
-    let curChunk;
-    try {
+      if (request.seed != null) pipeline.setSeed(request.seed);
+      const state: StreamGenerationState = {
+        id: crypto.randomUUID(),
+        created: getUnixTimestampSeconds(),
+        prevMessageLength: 0,
+      };
+      this.interruptSignal = false;
       await this.prefill(request, pipeline, chatConfig, genConfig);
-      curChunk = await _getChunk(pipeline); // prefill produces a chunk
-    } catch (err) {
+      yield* this.streamCurrentGeneration(
+        request,
+        model,
+        pipeline,
+        genConfig,
+        timeReceived,
+        state,
+        () => this.decode(pipeline, genConfig),
+        { emitCurrent: true },
+      );
+    } finally {
       await lock.release();
-      throw err;
     }
-    if (curChunk) {
-      yield curChunk;
-    }
-
-    while (!pipeline.stopped()) {
-      if (this.interruptSignal) {
-        // TODO: should we directly release lock here and return the async
-        // generator? Though no issue observed as of now with interruptGenerate()
-        pipeline.triggerStop();
-        break;
-      }
-      try {
-        await this.decode(pipeline, genConfig);
-        curChunk = await _getChunk(pipeline);
-      } catch (err) {
-        await lock.release();
-        throw err;
-      }
-      if (curChunk) {
-        yield curChunk;
-      }
-    }
-
-    // Reset seed -- we do not want this seed to affect future requests
-    if (request.seed !== null && request.seed !== undefined) {
-      pipeline.setSeed(Date.now());
-    }
-
-    // 3. Last chunk empty marking the end
-    // If function calling, use the last chunk to return tool_calls
-    let finish_reason = pipeline.getFinishReason()!;
-    let tool_calls:
-      | Array<ChatCompletionChunk.Choice.Delta.ToolCall>
-      | undefined;
-    try {
-      if (pipeline.getFinishReason() === "stop" && isFunctionCalling) {
-        // If stopped due to length or abort, cannot output return tool_calls field
-        finish_reason = "tool_calls";
-        const outputMessage = pipeline.getMessage();
-        tool_calls = getToolCallFromOutputMessage(
-          outputMessage,
-          /*isStreaming=*/ true,
-        ) as Array<ChatCompletionChunk.Choice.Delta.ToolCall>;
-      }
-    } catch (err) {
-      await lock.release();
-      throw err;
-    }
-
-    if (isChatCompletion) {
-      const lastChunk: ChatCompletionChunk = {
-        id: id,
-        choices: [
-          {
-            delta: isFunctionCalling
-              ? {
-                  role: "assistant",
-                  tool_calls: tool_calls,
-                }
-              : {},
-            finish_reason: finish_reason,
-            index: 0,
-          },
-        ],
-        model: model,
-        object: "chat.completion.chunk",
-        created: created,
-      };
-      yield lastChunk;
-    } else {
-      const lastChunk: Completion = {
-        id: id,
-        choices: [
-          {
-            text: "",
-            finish_reason: finish_reason,
-            index: 0,
-          },
-        ],
-        model: model,
-        object: "text_completion",
-        created: created,
-      };
-      yield lastChunk;
-    }
-
-    // 4. Usage chunk
-    if (request.stream_options?.include_usage) {
-      const usedGrammar =
-        "response_format" in request &&
-        (request.response_format?.type === "grammar" ||
-          request.response_format?.type === "json_object");
-      const completion_tokens = pipeline.getCurRoundDecodingTotalTokens();
-      const prompt_tokens = pipeline.getCurRoundPrefillTotalTokens();
-      const prefill_tokens_per_s = pipeline.getCurRoundPrefillTokensPerSec();
-      const decode_tokens_per_s = pipeline.getCurRoundDecodingTokensPerSec();
-      const grammar_init_s = pipeline.getCurRoundGrammarInitTotalTime();
-      const prefill_time = pipeline.getCurRoundPrefillTotalTime();
-      const decode_time = pipeline.getCurRoundDecodingTotalTime();
-      const grammar_per_token_s =
-        pipeline.getCurRoundGrammarPerTokenTotalTime();
-      const latencyBreakdown: LatencyBreakdown =
-        pipeline.getCurRoundLatencyBreakdown();
-
-      const defaultExtra = {
-        e2e_latency_s: (Date.now() - timeReceived) / 1000,
-        prefill_tokens_per_s: prefill_tokens_per_s,
-        decode_tokens_per_s: decode_tokens_per_s,
-        time_to_first_token_s: prefill_time,
-        time_per_output_token_s: decode_time / completion_tokens,
-        latencyBreakdown: request.extra_body?.enable_latency_breakdown
-          ? latencyBreakdown
-          : undefined,
-      };
-      const usage: CompletionUsage = {
-        completion_tokens: completion_tokens,
-        prompt_tokens: prompt_tokens,
-        total_tokens: completion_tokens + prompt_tokens,
-        extra: usedGrammar
-          ? {
-              ...defaultExtra,
-              ...{
-                grammar_init_s: grammar_init_s,
-                grammar_per_token_s: grammar_per_token_s / completion_tokens,
-              },
-            }
-          : defaultExtra,
-      };
-      if (isChatCompletion) {
-        const usageChunk: ChatCompletionChunk = {
-          id: id,
-          choices: [],
-          usage: usage,
-          model: model,
-          object: "chat.completion.chunk",
-          created: created,
-        };
-        yield usageChunk;
-      } else {
-        const usageChunk: Completion = {
-          id: id,
-          choices: [],
-          usage: usage,
-          model: model,
-          object: "text_completion",
-          created: created,
-        };
-        yield usageChunk;
-      }
-    }
-
-    await lock.release();
   }
 
   async interruptGenerate() {
@@ -824,10 +854,6 @@ export class MLCEngine implements MLCEngineInterface {
       enable_latency_breakdown: request.extra_body?.enable_latency_breakdown,
     };
 
-    // 0.5 Block wait until this pipeline finishes all previous requests
-    const lock = this.loadedModelIdToLock.get(selectedModelId)!;
-    await lock.acquire();
-
     // 1. If request is streaming, return an AsyncIterable (an iterable version of `_generate()`)
     if (request.stream) {
       return this.asyncGenerate(
@@ -839,6 +865,10 @@ export class MLCEngine implements MLCEngineInterface {
         timeReceived,
       );
     }
+
+    // 0.5 Block wait until this pipeline finishes all previous requests
+    const lock = this.loadedModelIdToLock.get(selectedModelId)!;
+    await lock.acquire();
 
     // Big try-finally to release lock in case of errors
     try {
@@ -1004,10 +1034,6 @@ export class MLCEngine implements MLCEngineInterface {
       ignore_eos: request.ignore_eos,
     };
 
-    // 0.5 Block wait until this pipeline finishes all previous requests
-    const lock = this.loadedModelIdToLock.get(selectedModelId)!;
-    await lock.acquire();
-
     // 1. If request is streaming, return an AsyncIterable (an iterable version of `_generate()`)
     if (request.stream) {
       return this.asyncGenerate(
@@ -1019,6 +1045,10 @@ export class MLCEngine implements MLCEngineInterface {
         timeReceived,
       );
     }
+
+    // 0.5 Block wait until this pipeline finishes all previous requests
+    const lock = this.loadedModelIdToLock.get(selectedModelId)!;
+    await lock.acquire();
 
     // Big try-finally to release lock in case of errors
     try {

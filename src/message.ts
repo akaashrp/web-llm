@@ -31,6 +31,7 @@ type RequestKind =
   | "chatCompletionStreamInit"
   | "completionStreamInit"
   | "completionStreamNextChunk"
+  | "completionStreamReturn"
   | "customRequest"
   | "keepAlive"
   | "setLogLevel"
@@ -78,6 +79,7 @@ export interface ChatCompletionNonStreamingParams {
 export interface ChatCompletionStreamInitParams {
   request: ChatCompletionRequestStreaming;
   selectedModelId: string;
+  streamId: string;
   modelId: string[];
   chatOpts?: ChatOptions[];
 }
@@ -89,6 +91,7 @@ export interface CompletionNonStreamingParams {
 export interface CompletionStreamInitParams {
   request: CompletionCreateParamsStreaming;
   selectedModelId: string;
+  streamId: string;
   modelId: string[];
   chatOpts?: ChatOptions[];
 }
@@ -98,7 +101,7 @@ export interface EmbeddingParams {
   chatOpts?: ChatOptions[];
 }
 export interface CompletionStreamNextChunkParams {
-  selectedModelId: string;
+  streamId: string;
 }
 
 export interface CustomRequestParams {

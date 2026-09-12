@@ -440,3 +440,99 @@ test("WebWorkerMLCEngine return cancels an ordinary stream before first next", a
     }),
   );
 });
+
+function connectWorkerStream(source: AsyncGenerator<any, void, void>) {
+  const handler = new WebWorkerMLCEngineHandler();
+  const worker = {
+    onmessage: (_event: any) => {
+      void _event;
+    },
+    postMessage: (msg: any) => {
+      setTimeout(() => handler.onmessage(msg), 0);
+    },
+  };
+  handler.postMessage = (msg) => worker.onmessage(msg);
+  (handler as any).streamIdToAsyncGenerator.set("ordered-stream", source);
+  const engine = new WebWorkerMLCEngine(worker);
+  return {
+    iterator: engine.asyncGenerate("ordered-stream"),
+    streams: (handler as any).streamIdToAsyncGenerator as Map<string, unknown>,
+  };
+}
+
+test("worker read-ahead returns done for every read beyond stream exhaustion", async () => {
+  const chunk = { object: "chat.completion.chunk", choices: [] };
+  const { iterator, streams } = connectWorkerStream(
+    (async function* () {
+      yield chunk;
+    })(),
+  );
+  await expect(
+    Promise.all([iterator.next(), iterator.next(), iterator.next()]),
+  ).resolves.toEqual([
+    { done: false, value: chunk },
+    { done: true, value: undefined },
+    { done: true, value: undefined },
+  ]);
+  expect(streams.size).toBe(0);
+});
+
+test("worker return waits for a pending read and closes the stream", async () => {
+  let unblock!: () => void;
+  const gate = new Promise<void>((resolve) => {
+    unblock = resolve;
+  });
+  let closes = 0;
+  const chunk = { object: "chat.completion.chunk", choices: [] };
+  const { iterator, streams } = connectWorkerStream(
+    (async function* () {
+      try {
+        await gate;
+        yield chunk;
+        yield chunk;
+      } finally {
+        closes++;
+      }
+    })(),
+  );
+  const pending = iterator.next();
+  const returned = iterator.return();
+  await flushMicrotasks();
+  expect(closes).toBe(0);
+  unblock();
+  expect(await pending).toEqual({ done: false, value: chunk });
+  expect(await returned).toEqual({ done: true, value: undefined });
+  expect(await iterator.next()).toEqual({ done: true, value: undefined });
+  expect(closes).toBe(1);
+  expect(streams.size).toBe(0);
+});
+
+test("worker inference failure retires the stream and queued reads return done", async () => {
+  const { iterator, streams } = connectWorkerStream(
+    (async function* () {
+      yield { object: "chat.completion.chunk", choices: [] };
+      throw new Error("decode failed");
+    })(),
+  );
+  await iterator.next();
+  const failure = expect(iterator.next()).rejects.toBe("Error: decode failed");
+  const afterFailure = iterator.next();
+  await failure;
+  expect(await afterFailure).toEqual({ done: true, value: undefined });
+  expect(streams.size).toBe(0);
+});
+
+test("worker throw before first read closes the unused stream", async () => {
+  let started = false;
+  const { iterator, streams } = connectWorkerStream(
+    (async function* () {
+      started = true;
+      yield { object: "chat.completion.chunk", choices: [] };
+    })(),
+  );
+  const failure = new Error("consumer stopped");
+  await expect(iterator.throw(failure)).rejects.toBe(failure);
+  expect(await iterator.next()).toEqual({ done: true, value: undefined });
+  expect(started).toBe(false);
+  expect(streams.size).toBe(0);
+});

@@ -684,47 +684,36 @@ export class WebWorkerMLCEngine implements MLCEngineInterface {
       return closePromise;
     };
 
-    const iterator: AsyncIterableIterator<ChatCompletionChunk | Completion> = {
-      next: async () => {
-        if (completed) {
-          return { done: true, value: undefined };
-        }
-        const msg: WorkerRequest = {
-          kind: "completionStreamNextChunk",
-          uuid: crypto.randomUUID(),
-          content: { streamId } as CompletionStreamNextChunkParams,
-        };
-        try {
-          const ret = await this.getPromise<
-            ChatCompletionChunk | Completion | void
-          >(msg);
+    const getPromise = this.getPromise.bind(this);
+    // Native generators serialize next/return/throw, including reads at EOF.
+    const iterator = (async function* () {
+      try {
+        while (true) {
+          const msg: WorkerRequest = {
+            kind: "completionStreamNextChunk",
+            uuid: crypto.randomUUID(),
+            content: { streamId } as CompletionStreamNextChunkParams,
+          };
+          const ret = await getPromise<ChatCompletionChunk | Completion | void>(
+            msg,
+          );
           if (typeof ret !== "object") {
             completed = true;
-            return { done: true, value: undefined };
+            return;
           }
-          return { done: false, value: ret };
-        } catch (err) {
-          await close().catch(() => undefined);
-          throw err;
+          yield ret;
         }
-      },
-      return: async () => {
+      } finally {
         await close();
-        return { done: true, value: undefined };
-      },
-      throw: async (err?: unknown) => {
-        await close().catch(() => undefined);
-        throw err;
-      },
-      [Symbol.asyncIterator]() {
-        return this;
-      },
-    };
-    return iterator as AsyncGenerator<
-      ChatCompletionChunk | Completion,
-      void,
-      void
-    >;
+      }
+    })();
+
+    // A generator closed before its first next() never enters its finally.
+    const returnSource = iterator.return.bind(iterator);
+    const throwSource = iterator.throw.bind(iterator);
+    iterator.return = (value) => returnSource(value).finally(close);
+    iterator.throw = (err) => throwSource(err).finally(close);
+    return iterator;
   }
 
   async chatCompletion(

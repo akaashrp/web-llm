@@ -62,7 +62,7 @@ jest.mock("../src/llm_chat", () => {
     async asyncLoadWebGPUPipelines() {}
     dispose() {}
     async sync() {}
-    setSeed(_seed: number) {}
+    setSeed() {}
 
     getConversationObject() {
       return this.conversation;
@@ -558,7 +558,9 @@ describe("ordinary stream lifecycle", () => {
       const seed = jest.spyOn(pipeline, "setSeed");
       const stop = jest.spyOn(pipeline, "triggerStop");
       const iterator = await start(engine, 17);
-      while (!(await iterator.next()).done) {}
+      while (!(await iterator.next()).done) {
+        // Consume through the final chunk so normal cleanup runs.
+      }
       expect(seed.mock.calls).toEqual([[17], [FIXED_CREATED_DATE.getTime()]]);
       expect(stop).not.toHaveBeenCalled();
     });

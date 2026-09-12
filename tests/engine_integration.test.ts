@@ -62,6 +62,7 @@ jest.mock("../src/llm_chat", () => {
     async asyncLoadWebGPUPipelines() {}
     dispose() {}
     async sync() {}
+    setSeed(_seed: number) {}
 
     getConversationObject() {
       return this.conversation;
@@ -470,18 +471,20 @@ describe("MLCEngine deterministic integration", () => {
 
 describe("ordinary stream lifecycle", () => {
   for (const endpoint of ["chat", "completion"] as const) {
-    const start = async (engine: MLCEngine) => {
+    const start = async (engine: MLCEngine, seed?: number) => {
       const stream =
         endpoint === "chat"
           ? await engine.chatCompletion({
               model: MODEL_ID,
               messages: [{ role: "user", content: "Stream" }],
               stream: true,
+              seed,
             })
           : await engine.completion({
               model: MODEL_ID,
               prompt: "Stream",
               stream: true,
+              seed,
             });
       return stream[Symbol.asyncIterator]();
     };
@@ -513,19 +516,72 @@ describe("ordinary stream lifecycle", () => {
       await next.return!();
     });
 
+    test(`${endpoint}: closing an unused seeded stream leaves pipeline state untouched`, async () => {
+      const { engine, pipeline } = createEngineWithPipeline(4);
+      const seed = jest.spyOn(pipeline, "setSeed");
+      const stop = jest.spyOn(pipeline, "triggerStop");
+      const iterator = await start(engine, 17);
+      await iterator.return!();
+      expect(seed).not.toHaveBeenCalled();
+      expect(stop).not.toHaveBeenCalled();
+    });
+
+    test(`${endpoint}: cancellation stops the reply and resets its seed before releasing the lock`, async () => {
+      jest.useFakeTimers().setSystemTime(FIXED_CREATED_DATE);
+      const { engine, pipeline } = createEngineWithPipeline(4);
+      const seed = jest.spyOn(pipeline, "setSeed");
+      const stop = jest.spyOn(pipeline, "triggerStop");
+      const lock = (engine as any).loadedModelIdToLock.get(MODEL_ID);
+      const release = jest.spyOn(lock, "release");
+      const iterator = await start(engine, 17);
+      await iterator.next();
+      await iterator.return!();
+      await iterator.return!();
+      expect(pipeline.stopped()).toBe(true);
+      expect(stop).toHaveBeenCalledTimes(1);
+      expect(seed.mock.calls).toEqual([[17], [FIXED_CREATED_DATE.getTime()]]);
+      expect(seed.mock.invocationCallOrder[1]).toBeLessThan(
+        release.mock.invocationCallOrder[0],
+      );
+      expect(stop.mock.invocationCallOrder[0]).toBeLessThan(
+        release.mock.invocationCallOrder[0],
+      );
+      const next = await start(engine);
+      await next.next();
+      await next.return!();
+      expect(seed).toHaveBeenCalledTimes(2);
+    });
+
+    test(`${endpoint}: normal completion resets the seed without aborting the reply`, async () => {
+      jest.useFakeTimers().setSystemTime(FIXED_CREATED_DATE);
+      const { engine, pipeline } = createEngineWithPipeline(2);
+      const seed = jest.spyOn(pipeline, "setSeed");
+      const stop = jest.spyOn(pipeline, "triggerStop");
+      const iterator = await start(engine, 17);
+      while (!(await iterator.next()).done) {}
+      expect(seed.mock.calls).toEqual([[17], [FIXED_CREATED_DATE.getTime()]]);
+      expect(stop).not.toHaveBeenCalled();
+    });
+
     for (const stage of ["prefill", "decode"] as const) {
       test(`${endpoint}: ${stage} failure releases the model lock`, async () => {
-        const { engine } = createEngineWithPipeline(4);
+        const { engine, pipeline } = createEngineWithPipeline(4);
+        const seed = jest.spyOn(pipeline, "setSeed");
+        const stop = jest.spyOn(pipeline, "triggerStop");
         const lock = (engine as any).loadedModelIdToLock.get(MODEL_ID);
         const release = jest.spyOn(lock, "release");
         const error = new Error("inference failed");
         const fail = jest
           .spyOn(engine as any, stage)
           .mockRejectedValueOnce(error);
-        const iterator = await start(engine);
+        const iterator = await start(engine, 17);
         if (stage === "decode") await iterator.next();
         await expect(iterator.next()).rejects.toBe(error);
         expect(release).toHaveBeenCalledTimes(1);
+        expect(seed).toHaveBeenCalledTimes(2);
+        expect(seed.mock.calls[0]).toEqual([17]);
+        expect(seed.mock.calls[1][0]).not.toBe(17);
+        expect(stop).toHaveBeenCalledTimes(stage === "decode" ? 1 : 0);
         fail.mockRestore();
         const next = await start(engine);
         expect(await next.next()).toMatchObject({ done: false });

@@ -716,9 +716,6 @@ export class MLCEngine implements MLCEngineInterface {
       }
     }
 
-    if (request.seed !== null && request.seed !== undefined) {
-      pipeline.setSeed(Date.now());
-    }
     await opts.beforeFinalChunk?.();
     yield this.makeStreamFinalChunk(request, model, pipeline, state);
 
@@ -766,6 +763,8 @@ export class MLCEngine implements MLCEngineInterface {
     // or iterator return. Creating an unconsumed stream owns no model lock.
     const lock = this.loadedModelIdToLock.get(model)!;
     await lock.acquire();
+    let seeded = false;
+    let prefilled = false;
     try {
       const isChatCompletion = "messages" in request;
       const isFunctionCalling = "tools" in request && request.tools != null;
@@ -775,7 +774,10 @@ export class MLCEngine implements MLCEngineInterface {
         );
       }
       postInitAndCheckGenerationConfigValues(genConfig);
-      if (request.seed != null) pipeline.setSeed(request.seed);
+      if (request.seed != null) {
+        pipeline.setSeed(request.seed);
+        seeded = true;
+      }
       const state: StreamGenerationState = {
         id: crypto.randomUUID(),
         created: getUnixTimestampSeconds(),
@@ -783,6 +785,7 @@ export class MLCEngine implements MLCEngineInterface {
       };
       this.interruptSignal = false;
       await this.prefill(request, pipeline, chatConfig, genConfig);
+      prefilled = true;
       yield* this.streamCurrentGeneration(
         request,
         model,
@@ -794,7 +797,13 @@ export class MLCEngine implements MLCEngineInterface {
         { emitCurrent: true },
       );
     } finally {
-      await lock.release();
+      try {
+        // Iterator return skips the decode loop's normal stop path.
+        if (prefilled && !pipeline.stopped()) pipeline.triggerStop();
+        if (seeded) pipeline.setSeed(Date.now());
+      } finally {
+        await lock.release();
+      }
     }
   }
 

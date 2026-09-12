@@ -57,6 +57,7 @@ export {
   Completion,
   CompletionChoice,
   postInitAndCheckFields as postInitAndCheckFieldsCompletion,
+  rejectCompletionResumable,
 } from "./completion";
 
 export {

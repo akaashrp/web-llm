@@ -1,5 +1,6 @@
 import { AppConfig, ChatOptions } from "./config";
 import { InitProgressReport, LogLevel } from "./types";
+import { ResumeProbeResult, ResumeResult } from "./types";
 import {
   ChatCompletionRequestStreaming,
   ChatCompletionRequestNonStreaming,
@@ -27,6 +28,10 @@ type RequestKind =
   | "chatCompletionNonStreaming"
   | "completionNonStreaming"
   | "embedding"
+  | "listResumableSessions"
+  | "resumeChatCompletion"
+  | "resumeChatCompletionStreamInit"
+  | "deleteResumableSession"
   | "getMessage"
   | "chatCompletionStreamInit"
   | "completionStreamInit"
@@ -103,6 +108,14 @@ export interface EmbeddingParams {
 export interface CompletionStreamNextChunkParams {
   streamId: string;
 }
+export interface ResumeChatCompletionParams {
+  sessionId: string;
+  options?: { continueGeneration?: boolean; stream?: boolean };
+  streamId?: string;
+}
+export interface DeleteResumableSessionParams {
+  sessionId: string;
+}
 
 export interface CustomRequestParams {
   requestName: string;
@@ -119,6 +132,8 @@ export type MessageContent =
   | CompletionNonStreamingParams
   | CompletionStreamInitParams
   | EmbeddingParams
+  | ResumeChatCompletionParams
+  | DeleteResumableSessionParams
   | CompletionStreamNextChunkParams
   | CustomRequestParams
   | InitProgressReport
@@ -130,6 +145,8 @@ export type MessageContent =
   | ChatCompletionChunk
   | CreateEmbeddingResponse
   | Completion
+  | ResumeProbeResult[]
+  | ResumeResult
   | AppConfig
   | void;
 /**

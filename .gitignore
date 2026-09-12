@@ -326,3 +326,6 @@ lib
 
 **/.next
 coverage
+.browser-test/
+playwright-report/
+test-results/

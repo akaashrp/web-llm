@@ -1,6 +1,14 @@
 import * as tvmjs from "@mlc-ai/web-runtime";
 import log from "loglevel";
 import {
+  StreamGenerationState,
+  StreamContinuationOptions,
+  onceAsync,
+  managedAsyncIterable,
+  lazyAsyncIterable,
+  isAsyncIterable,
+} from "./streaming";
+import {
   ChatConfig,
   ChatOptions,
   AppConfig,
@@ -12,7 +20,12 @@ import {
   DefaultLogLevel,
   ModelType,
 } from "./config";
-import { LLMChatPipeline } from "./llm_chat";
+import {
+  LLMChatPipeline,
+  SampleDecodeOptions,
+  SamplePrefillOptions,
+  SampledGenerationStep,
+} from "./llm_chat";
 import {
   // ChatCompletion
   ChatCompletionRequest,
@@ -42,6 +55,9 @@ import {
   LogitProcessor,
   LogLevel,
   LatencyBreakdown,
+  ResumeProbeResult,
+  ResumeResult,
+  ResumeChatCompletionOptions,
 } from "./types";
 import {
   compareConversationObject,
@@ -76,6 +92,19 @@ import {
 } from "./cache_util";
 import { EmbeddingPipeline } from "./embedding";
 import { verifyIntegrity } from "./integrity";
+import { ResumableGenerationJournal } from "./resumable/generation";
+import {
+  OPFSFileStore,
+  createOPFSFileStore,
+} from "./resumable/opfs_file_store";
+import { ResumableSessionStore } from "./resumable/session_store";
+import {
+  DecodeCheckpointScheduler,
+  ResumableEngineMetrics,
+  ResumableGenerationCoordinator,
+  isChatCompletionReplayRequest,
+  replayPromptSeqLen,
+} from "./resumable/coordinator";
 
 function getUnixTimestampSeconds(): number {
   return Math.floor(Date.now() / 1000);
@@ -92,17 +121,8 @@ function countTrailingReplacementChar(value: string): number {
   return count;
 }
 
-interface StreamGenerationState {
-  id: string;
-  created: number;
-  prevMessageLength: number;
-}
-
-interface StreamContinuationOptions {
-  emitCurrent?: boolean;
-  skipEmptyDelta?: boolean;
-  completionTokenOffset?: number;
-  beforeFinalChunk?: () => Promise<void>;
+interface EngineSamplePrefillOptions extends SamplePrefillOptions {
+  reuseKVCache?: boolean;
 }
 
 /**
@@ -165,6 +185,10 @@ export class MLCEngine implements MLCEngineInterface {
   private logitProcessorRegistry?: Map<string, LogitProcessor>;
   private initProgressCallback?: InitProgressCallback;
   private appConfig: AppConfig;
+  private resumableFileStore?: OPFSFileStore;
+  private resumableSessionStore?: ResumableSessionStore;
+  private lastResumableMetrics?: ResumableEngineMetrics;
+  private readonly resumableCoordinator: ResumableGenerationCoordinator;
 
   // Signals and flags
   private interruptSignal = false;
@@ -183,6 +207,25 @@ export class MLCEngine implements MLCEngineInterface {
     this.setLogLevel(engineConfig?.logLevel || DefaultLogLevel);
     this.setInitProgressCallback(engineConfig?.initProgressCallback);
     this.setLogitProcessorRegistry(engineConfig?.logitProcessorRegistry);
+    this.resumableCoordinator = new ResumableGenerationCoordinator({
+      host: {
+        resetInterrupt: () => {
+          this.interruptSignal = false;
+        },
+        isInterrupted: () => this.interruptSignal,
+        samplePrefill: (...args) => this.samplePrefill(...args),
+        sampleDecode: (...args) => this.sampleDecode(...args),
+        streamCurrentGeneration: (...args) =>
+          this.streamCurrentGeneration(...args),
+      },
+      getFileStore: () => this.getResumableFileStore(),
+      getSessionStore: () => this.getResumableSessionStore(),
+      hasCustomLogitProcessor: (modelId) =>
+        this.logitProcessorRegistry?.has(modelId) === true,
+      onMetricsChanged: (metrics) => {
+        this.lastResumableMetrics = metrics;
+      },
+    });
 
     this.chat = new API.Chat(this);
     this.completions = new API.Completions(this);
@@ -209,6 +252,22 @@ export class MLCEngine implements MLCEngineInterface {
     logitProcessorRegistry?: Map<string, LogitProcessor>,
   ) {
     this.logitProcessorRegistry = logitProcessorRegistry;
+  }
+
+  private getResumableFileStore(): OPFSFileStore {
+    if (this.resumableFileStore === undefined) {
+      this.resumableFileStore = createOPFSFileStore();
+    }
+    return this.resumableFileStore;
+  }
+
+  private getResumableSessionStore(): ResumableSessionStore {
+    if (this.resumableSessionStore === undefined) {
+      this.resumableSessionStore = new ResumableSessionStore(
+        this.getResumableFileStore(),
+      );
+    }
+    return this.resumableSessionStore;
   }
 
   /**
@@ -742,6 +801,7 @@ export class MLCEngine implements MLCEngineInterface {
     chatConfig: ChatConfig,
     genConfig: GenerationConfig,
     timeReceived: number,
+    journal?: ResumableGenerationJournal,
   ): AsyncGenerator<ChatCompletionChunk, void, void>;
   asyncGenerate(
     request: CompletionCreateParamsStreaming,
@@ -750,6 +810,7 @@ export class MLCEngine implements MLCEngineInterface {
     chatConfig: ChatConfig,
     genConfig: GenerationConfig,
     timeReceived: number,
+    journal?: ResumableGenerationJournal,
   ): AsyncGenerator<Completion, void, void>;
   async *asyncGenerate(
     request: ChatCompletionRequestStreaming | CompletionCreateParamsStreaming,
@@ -758,16 +819,27 @@ export class MLCEngine implements MLCEngineInterface {
     chatConfig: ChatConfig,
     genConfig: GenerationConfig,
     timeReceived: number,
+    journal?: ResumableGenerationJournal,
   ): AsyncGenerator<ChatCompletionChunk | Completion, void, void> {
-    // Acquire only when iteration starts, and release on completion, failure,
-    // or iterator return. Creating an unconsumed stream owns no model lock.
     const lock = this.loadedModelIdToLock.get(model)!;
-    await lock.acquire();
+    let lockAcquired = false;
+    let journalStarted = false;
+    let journalEnded = false;
+    let failure: unknown;
     let seeded = false;
     let prefilled = false;
     try {
+      await lock.acquire();
+      lockAcquired = true;
+      if (journal !== undefined) {
+        this.resumableCoordinator.resetMetrics();
+      }
+
       const isChatCompletion = "messages" in request;
-      const isFunctionCalling = "tools" in request && request.tools != null;
+      const isFunctionCalling =
+        "tools" in request &&
+        request.tools !== undefined &&
+        request.tools !== null;
       if (isFunctionCalling && !isChatCompletion) {
         throw new Error(
           "Expect `chat.completions` with tools, not `completions`.",
@@ -778,31 +850,128 @@ export class MLCEngine implements MLCEngineInterface {
         pipeline.setSeed(request.seed);
         seeded = true;
       }
-      const state: StreamGenerationState = {
+      const streamState: StreamGenerationState = {
         id: crypto.randomUUID(),
         created: getUnixTimestampSeconds(),
         prevMessageLength: 0,
       };
       this.interruptSignal = false;
-      await this.prefill(request, pipeline, chatConfig, genConfig);
-      prefilled = true;
+
+      let checkpointScheduler: DecodeCheckpointScheduler | undefined;
+      let resumablePromptSeqLen = 0;
+      if (journal === undefined) {
+        await this.prefill(request, pipeline, chatConfig, genConfig);
+        prefilled = true;
+      } else {
+        const prefillStep = await this.samplePrefill(
+          request,
+          pipeline,
+          chatConfig,
+          genConfig,
+          {
+            capturePromptCheckpoint:
+              await this.resumableCoordinator.shouldCapturePromptCheckpoint(
+                journal,
+              ),
+            storeCheckpointLogits: journal.storeCheckpointLogits,
+            reuseKVCache: false,
+          },
+        );
+        if (prefillStep.promptTokenIds === undefined) {
+          throw new Error(
+            "Resumable generation currently supports text-only prompts.",
+          );
+        }
+        await journal.begin({
+          modelId: model,
+          request,
+          promptTokenIds: prefillStep.promptTokenIds,
+          assistantPrefixTokenIds: prefillStep.assistantPrefixTokenIds ?? [],
+          generationConfig: genConfig,
+        });
+        journalStarted = journal.active;
+        resumablePromptSeqLen = prefillStep.globalTokenPos;
+        checkpointScheduler = {
+          intervalTokens: journal.checkpointIntervalTokens,
+          lastCheckpointSeqLen: prefillStep.globalTokenPos,
+        };
+        await this.resumableCoordinator.writePromptCheckpoint(
+          journal,
+          prefillStep,
+          checkpointScheduler,
+        );
+        const committedPrefill = pipeline.commitSampledStep(
+          prefillStep,
+          genConfig,
+        );
+        await this.resumableCoordinator.recordGeneratedToken(
+          journal,
+          pipeline,
+          prefillStep,
+          committedPrefill,
+        );
+      }
+
       yield* this.streamCurrentGeneration(
         request,
         model,
         pipeline,
         genConfig,
         timeReceived,
-        state,
-        () => this.decode(pipeline, genConfig),
-        { emitCurrent: true },
+        streamState,
+        async () => {
+          if (journal === undefined) {
+            await this.decode(pipeline, genConfig);
+            return;
+          }
+          await this.resumableCoordinator.decodeGenerationStep(
+            journal,
+            checkpointScheduler!,
+            resumablePromptSeqLen,
+            pipeline,
+            genConfig,
+          );
+        },
+        {
+          emitCurrent: true,
+          beforeFinalChunk: async () => {
+            if (journal === undefined) {
+              return;
+            }
+            await this.resumableCoordinator.finishJournal(
+              journal,
+              pipeline.getFinishReason(),
+            );
+            journalEnded = true;
+          },
+        },
       );
+    } catch (err) {
+      failure = err;
+      if (journal !== undefined && journalStarted) {
+        await this.resumableCoordinator.recordEngineError(journal, err);
+      }
+      throw err;
     } finally {
       try {
-        // Iterator return skips the decode loop's normal stop path.
-        if (prefilled && !pipeline.stopped()) pipeline.triggerStop();
-        if (seeded) pipeline.setSeed(Date.now());
+        if (journal !== undefined) {
+          await this.resumableCoordinator.closeStreamJournal(
+            journal,
+            pipeline,
+            journalStarted && !journalEnded,
+            failure,
+          );
+        } else if (prefilled && !pipeline.stopped()) {
+          pipeline.triggerStop();
+        }
       } finally {
-        await lock.release();
+        try {
+          if (seeded) pipeline.setSeed(Date.now());
+        } finally {
+          if (lockAcquired) {
+            await lock.release();
+          }
+        }
       }
     }
   }
@@ -862,6 +1031,12 @@ export class MLCEngine implements MLCEngineInterface {
       enable_thinking: request.extra_body?.enable_thinking,
       enable_latency_breakdown: request.extra_body?.enable_latency_breakdown,
     };
+    const resumableConfig = this.resumableCoordinator.normalizeForRequest(
+      request,
+      selectedModelId,
+    );
+    const resumableJournal =
+      this.resumableCoordinator.tryCreateJournal(resumableConfig);
 
     // 1. If request is streaming, return an AsyncIterable (an iterable version of `_generate()`)
     if (request.stream) {
@@ -872,10 +1047,11 @@ export class MLCEngine implements MLCEngineInterface {
         selectedChatConfig,
         genConfig,
         timeReceived,
+        resumableJournal,
       );
     }
 
-    // 0.5 Block wait until this pipeline finishes all previous requests
+    // 0.5 Block wait until this pipeline finishes all previous requests.
     const lock = this.loadedModelIdToLock.get(selectedModelId)!;
     await lock.acquire();
 
@@ -901,12 +1077,22 @@ export class MLCEngine implements MLCEngineInterface {
           selectedPipeline.triggerStop();
           outputMessage = "";
         } else {
-          outputMessage = await this._generate(
-            request,
-            selectedPipeline,
-            selectedChatConfig,
-            genConfig,
-          );
+          outputMessage =
+            resumableJournal === undefined
+              ? await this._generate(
+                  request,
+                  selectedPipeline,
+                  selectedChatConfig,
+                  genConfig,
+                )
+              : await this.resumableCoordinator.generate(
+                  request,
+                  selectedModelId,
+                  selectedPipeline,
+                  selectedChatConfig,
+                  genConfig,
+                  resumableJournal,
+                );
         }
         let finish_reason = selectedPipeline.getFinishReason()!;
 
@@ -1024,6 +1210,7 @@ export class MLCEngine implements MLCEngineInterface {
     request: CompletionCreateParams,
   ): Promise<AsyncIterable<Completion> | Completion> {
     const timeReceived = Date.now();
+    API.rejectCompletionResumable(request);
 
     // 0. Check model loaded and preprocess inputs
     const [selectedModelId, selectedPipeline, selectedChatConfig] =
@@ -1041,6 +1228,7 @@ export class MLCEngine implements MLCEngineInterface {
       logprobs: request.logprobs,
       top_logprobs: request.top_logprobs,
       ignore_eos: request.ignore_eos,
+      enable_latency_breakdown: request.extra_body?.enable_latency_breakdown,
     };
 
     // 1. If request is streaming, return an AsyncIterable (an iterable version of `_generate()`)
@@ -1186,6 +1374,201 @@ export class MLCEngine implements MLCEngineInterface {
     } finally {
       await lock.release();
     }
+  }
+
+  async listResumableSessions(): Promise<ResumeProbeResult[]> {
+    return this.resumableCoordinator.listSessions();
+  }
+
+  async resumeChatCompletion(
+    sessionId: string,
+    options?: ResumeChatCompletionOptions,
+  ): Promise<ResumeResult | AsyncIterable<ChatCompletionChunk>> {
+    if (options?.continueGeneration !== true) {
+      return this.resumableCoordinator.readTextOnlyResult(sessionId);
+    }
+
+    if (options.stream === true) {
+      const replayState =
+        await this.resumableCoordinator.readReplayState(sessionId);
+      if (
+        this.resumableCoordinator.canAttemptContinuation(replayState) &&
+        isChatCompletionReplayRequest(replayState.request) &&
+        replayState.request.stream === true
+      ) {
+        try {
+          const [selectedModelId] = this.getLLMStates(
+            "resumeChatCompletion",
+            replayState.modelId,
+          );
+          if (selectedModelId !== replayState.modelId) {
+            return this.resumableCoordinator.makeTextOnlyResumeResult(
+              replayState,
+            );
+          }
+        } catch (err) {
+          if (
+            err instanceof ModelNotLoadedError ||
+            err instanceof SpecifiedModelNotFoundError
+          ) {
+            return this.resumableCoordinator.makeTextOnlyResumeResult(
+              replayState,
+            );
+          }
+          throw err;
+        }
+        return lazyAsyncIterable(async () => {
+          const resumed = await this.resumeChatCompletionEager(
+            sessionId,
+            options,
+          );
+          if (!isAsyncIterable<ChatCompletionChunk>(resumed)) {
+            throw new Error(
+              `Resumable session ${sessionId} became unavailable for continued streaming.`,
+            );
+          }
+          return resumed;
+        });
+      }
+    }
+
+    return this.resumeChatCompletionEager(sessionId, options);
+  }
+
+  private async resumeChatCompletionEager(
+    sessionId: string,
+    options: ResumeChatCompletionOptions | undefined,
+  ): Promise<ResumeResult | AsyncIterable<ChatCompletionChunk>> {
+    const locked = await this.resumableCoordinator.openLockedSession(sessionId);
+    let releaseSessionLockOnExit = true;
+    try {
+      this.resumableCoordinator.resetMetrics();
+      const replayState = locked.state;
+      if (replayState.resumableConfig === undefined) {
+        throw new Error(
+          `Resumable session ${sessionId} is missing or has malformed resumable generation config.`,
+        );
+      }
+
+      let selectedModelId: string;
+      let selectedPipeline: LLMChatPipeline;
+      let selectedChatConfig: ChatConfig;
+      try {
+        [selectedModelId, selectedPipeline, selectedChatConfig] =
+          this.getLLMStates("resumeChatCompletion", replayState.modelId);
+      } catch (err) {
+        if (
+          err instanceof ModelNotLoadedError ||
+          err instanceof SpecifiedModelNotFoundError
+        ) {
+          return this.resumableCoordinator.makeTextOnlyResumeResult(
+            replayState,
+          );
+        }
+        throw err;
+      }
+      if (selectedModelId !== replayState.modelId) {
+        return this.resumableCoordinator.makeTextOnlyResumeResult(replayState);
+      }
+
+      const lock = this.loadedModelIdToLock.get(selectedModelId)!;
+      await lock.acquire();
+      let releaseModelLockOnExit = true;
+      try {
+        if (replayState.generationConfig === undefined) {
+          return this.resumableCoordinator.makeTextOnlyResumeResult(
+            replayState,
+          );
+        }
+        const genConfig = replayState.generationConfig;
+        postInitAndCheckGenerationConfigValues(genConfig);
+        let restored = await this.resumableCoordinator.tryRestoreKVResumeState(
+          locked,
+          selectedPipeline,
+          genConfig,
+        );
+        if (restored === undefined) {
+          restored = await this.resumableCoordinator.restoreByTokenReplay(
+            replayState,
+            selectedPipeline,
+            genConfig,
+          );
+        }
+        if (restored === undefined) {
+          return this.resumableCoordinator.makeTextOnlyResumeResult(
+            replayState,
+          );
+        }
+
+        const resumeJournal =
+          await this.resumableCoordinator.createResumeContinuationJournal(
+            locked,
+          );
+        const checkpointScheduler =
+          this.resumableCoordinator.createResumeCheckpointScheduler(
+            resumeJournal,
+            restored,
+          );
+        const promptSeqLen = replayPromptSeqLen(replayState);
+
+        if (
+          options?.stream === true &&
+          isChatCompletionReplayRequest(replayState.request) &&
+          replayState.request.stream === true
+        ) {
+          releaseModelLockOnExit = false;
+          releaseSessionLockOnExit = false;
+          const cleanup = onceAsync(async () => {
+            try {
+              await resumeJournal.close();
+            } finally {
+              try {
+                await lock.release();
+              } finally {
+                locked.release();
+              }
+            }
+          });
+          const source = this.resumableCoordinator.streamContinuation(
+            replayState.request,
+            selectedModelId,
+            selectedPipeline,
+            selectedChatConfig,
+            genConfig,
+            replayState,
+            restored,
+            resumeJournal,
+            checkpointScheduler,
+            promptSeqLen,
+            cleanup,
+          );
+          return managedAsyncIterable(source, cleanup);
+        }
+
+        return await this.resumableCoordinator.finishContinuation(
+          replayState,
+          selectedPipeline,
+          selectedChatConfig,
+          genConfig,
+          restored,
+          resumeJournal,
+          checkpointScheduler,
+          promptSeqLen,
+        );
+      } finally {
+        if (releaseModelLockOnExit) {
+          await lock.release();
+        }
+      }
+    } finally {
+      if (releaseSessionLockOnExit) {
+        locked.release();
+      }
+    }
+  }
+
+  async deleteResumableSession(sessionId: string): Promise<void> {
+    await this.resumableCoordinator.deleteSession(sessionId);
   }
 
   //-----------------------------
@@ -1400,20 +1783,24 @@ export class MLCEngine implements MLCEngineInterface {
    * @param input The OpenAI-style prompt to prefill.
    * @param pipeline The loaded pipeline, hence model, to carry out this prefill.
    * @param chatConfig The chat config to use for this model.
-   * @param genConfig Generation config.
+   * @param reuseKVCache Whether a matching conversation may reuse its existing KV cache.
    */
-  async prefill(
+  private preparePrefillInput(
     input: ChatCompletionRequest | CompletionCreateParams,
     pipeline: LLMChatPipeline,
     chatConfig: ChatConfig,
-    genConfig: GenerationConfig,
-  ) {
+    reuseKVCache = true,
+  ): {
+    inputStr: string;
+    lastMsgRole: Role;
+    inputRoleStr?: string;
+  } {
     // TODO: SPECIFY MODEL TO PERFORM PREFILL, HENCE RETRIEVE CONFIG
     if (chatConfig === undefined) {
       throw new ConfigurationNotInitializedError();
     }
-    let input_str: string;
-    let input_role_str: string | undefined;
+    let inputStr: string;
+    let inputRoleStr: string | undefined;
     let lastMsgRole = Role.user;
     if ("messages" in input) {
       // For ChatCompletionRequest, we prepare input using `messages`
@@ -1423,7 +1810,7 @@ export class MLCEngine implements MLCEngineInterface {
         input,
         chatConfig,
       );
-      if (!compareConversationObject(oldConv, newConv)) {
+      if (!reuseKVCache || !compareConversationObject(oldConv, newConv)) {
         // Not the same conversation, so not multiround chatting, reset everything (KV cache, etc.)
         pipeline.resetChat();
         pipeline.setConversation(newConv);
@@ -1439,13 +1826,13 @@ export class MLCEngine implements MLCEngineInterface {
       const last_msg = input.messages[
         input.messages.length - 1
       ] as ChatCompletionMessageParam;
-      input_str = last_msg.content as string;
-      input_role_str =
+      inputStr = last_msg.content as string;
+      inputRoleStr =
         last_msg.role === "user" && last_msg.name ? last_msg.name : undefined;
       lastMsgRole = last_msg.role === "tool" ? Role.tool : Role.user;
     } else {
       // For CompletionCreateParams, the input is just the prompt
-      input_str = input.prompt;
+      inputStr = input.prompt;
       pipeline.resetChat();
       const newConv = getConversation(
         chatConfig.conv_template,
@@ -1454,11 +1841,43 @@ export class MLCEngine implements MLCEngineInterface {
       );
       pipeline.setConversation(newConv);
     }
-    return pipeline.prefillStep(
-      input_str,
+    return { inputStr, lastMsgRole, inputRoleStr };
+  }
+
+  async prefill(
+    input: ChatCompletionRequest | CompletionCreateParams,
+    pipeline: LLMChatPipeline,
+    chatConfig: ChatConfig,
+    genConfig: GenerationConfig,
+  ) {
+    const { inputStr, lastMsgRole, inputRoleStr } = this.preparePrefillInput(
+      input,
+      pipeline,
+      chatConfig,
+    );
+    return pipeline.prefillStep(inputStr, lastMsgRole, inputRoleStr, genConfig);
+  }
+
+  async samplePrefill(
+    input: ChatCompletionRequest | CompletionCreateParams,
+    pipeline: LLMChatPipeline,
+    chatConfig: ChatConfig,
+    genConfig: GenerationConfig,
+    opts: EngineSamplePrefillOptions = {},
+  ): Promise<SampledGenerationStep> {
+    const { reuseKVCache = true, ...pipelineOpts } = opts;
+    const { inputStr, lastMsgRole, inputRoleStr } = this.preparePrefillInput(
+      input,
+      pipeline,
+      chatConfig,
+      reuseKVCache,
+    );
+    return pipeline.samplePrefillStep(
+      inputStr,
       lastMsgRole,
-      input_role_str,
+      inputRoleStr,
       genConfig,
+      pipelineOpts,
     );
   }
 
@@ -1467,5 +1886,13 @@ export class MLCEngine implements MLCEngineInterface {
    */
   async decode(pipeline: LLMChatPipeline, genConfig?: GenerationConfig) {
     return pipeline.decodeStep(genConfig);
+  }
+
+  async sampleDecode(
+    pipeline: LLMChatPipeline,
+    genConfig?: GenerationConfig,
+    opts?: SampleDecodeOptions,
+  ): Promise<SampledGenerationStep> {
+    return pipeline.sampleDecodeStep(genConfig, opts);
   }
 }

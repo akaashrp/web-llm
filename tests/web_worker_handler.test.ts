@@ -13,6 +13,9 @@ const forwardMock = jest.fn<(...args: any[]) => Promise<any>>();
 const chatCompletionMock = jest.fn<(...args: any[]) => Promise<any>>();
 const completionMock = jest.fn<(...args: any[]) => Promise<any>>();
 const embeddingMock = jest.fn<(...args: any[]) => Promise<any>>();
+const listResumableSessionsMock = jest.fn<(...args: any[]) => Promise<any>>();
+const resumeChatCompletionMock = jest.fn<(...args: any[]) => Promise<any>>();
+const deleteResumableSessionMock = jest.fn<(...args: any[]) => Promise<any>>();
 const setLogitRegistryMock = jest.fn<(...args: any[]) => void>();
 const setAppConfigMock = jest.fn<(...args: any[]) => void>();
 
@@ -22,6 +25,9 @@ const mockEngineInstance: Record<string, any> = {
   chatCompletion: chatCompletionMock,
   completion: completionMock,
   embedding: embeddingMock,
+  listResumableSessions: listResumableSessionsMock,
+  resumeChatCompletion: resumeChatCompletionMock,
+  deleteResumableSession: deleteResumableSessionMock,
   setInitProgressCallback: jest.fn((cb) => {
     mockEngineInstance.__initCb = cb;
   }),
@@ -41,6 +47,9 @@ beforeEach(() => {
   chatCompletionMock.mockClear();
   completionMock.mockClear();
   embeddingMock.mockClear();
+  listResumableSessionsMock.mockClear();
+  resumeChatCompletionMock.mockClear();
+  deleteResumableSessionMock.mockClear();
   setLogitRegistryMock.mockClear();
   setAppConfigMock.mockClear();
   mockEngineInstance.__initCb = undefined;
@@ -156,6 +165,93 @@ test("embedding message reloads if needed and returns embeddings", async () => {
   expect(onComplete).toHaveBeenCalledWith({ object: "list", data: [] });
 });
 
+test("resumable session messages route to engine", async () => {
+  const handler = new WebWorkerMLCEngineHandler();
+  listResumableSessionsMock.mockResolvedValueOnce([
+    {
+      sessionId: "s1",
+      resumable: true,
+      modelId: "demo",
+      emittedTokens: 1,
+      processedSeqLen: 2,
+      recoveryMode: "text_only",
+    },
+  ]);
+  resumeChatCompletionMock.mockRejectedValueOnce(new Error("unsupported"));
+  deleteResumableSessionMock.mockResolvedValueOnce(undefined);
+  const onComplete = jest.fn();
+
+  handler.onmessage(
+    { kind: "listResumableSessions", uuid: "list", content: null } as any,
+    onComplete,
+  );
+  await flushMicrotasks();
+  expect(listResumableSessionsMock).toHaveBeenCalled();
+  expect(onComplete).toHaveBeenCalledWith([
+    expect.objectContaining({ sessionId: "s1" }),
+  ]);
+
+  handler.onmessage(
+    {
+      kind: "deleteResumableSession",
+      uuid: "delete",
+      content: { sessionId: "s1" },
+    } as any,
+    onComplete,
+  );
+  await flushMicrotasks();
+  expect(deleteResumableSessionMock).toHaveBeenCalledWith("s1");
+  expect(onComplete).toHaveBeenCalledWith(null);
+
+  handler.onmessage(
+    {
+      kind: "resumeChatCompletion",
+      uuid: "resume",
+      content: { sessionId: "s1", options: { continueGeneration: true } },
+    } as any,
+    onComplete,
+  );
+  await flushMicrotasks();
+  expect(resumeChatCompletionMock).toHaveBeenCalledWith("s1", {
+    continueGeneration: true,
+  });
+  expect(globalThis.postMessage).toHaveBeenCalledWith(
+    expect.objectContaining({ kind: "throw", uuid: "resume" }),
+  );
+});
+
+test("resumeChatCompletionStreamInit registers resumed async generator", async () => {
+  const handler = new WebWorkerMLCEngineHandler();
+  async function* generator() {
+    yield { object: "chat.completion.chunk" } as any;
+  }
+  resumeChatCompletionMock.mockResolvedValueOnce(generator());
+  const onComplete = jest.fn();
+
+  handler.onmessage(
+    {
+      kind: "resumeChatCompletionStreamInit",
+      uuid: "resume-stream",
+      content: {
+        sessionId: "session-stream",
+        streamId: "resume-stream-id",
+        options: { continueGeneration: true, stream: true },
+      },
+    } as any,
+    onComplete,
+  );
+  await flushMicrotasks();
+
+  expect(resumeChatCompletionMock).toHaveBeenCalledWith("session-stream", {
+    continueGeneration: true,
+    stream: true,
+  });
+  expect(onComplete).toHaveBeenCalledWith(null);
+  expect(
+    (handler as any).streamIdToAsyncGenerator.get("resume-stream-id"),
+  ).toBeDefined();
+});
+
 test("reloadIfUnmatched triggers reload when model lists differ", async () => {
   const handler = new WebWorkerMLCEngineHandler();
   handler.modelId = ["a"];
@@ -210,6 +306,8 @@ class MockWorker {
     }));
     this.setResponder("embedding", () => ({ object: "list", data: [] }));
     this.setResponder("reload", () => null);
+    this.setResponder("listResumableSessions", () => []);
+    this.setResponder("deleteResumableSession", () => null);
     this.setResponder("completionStreamReturn", () => null);
   }
 
@@ -380,6 +478,119 @@ test("WebWorkerMLCEngine info helpers resolve via worker messages", async () => 
   expect(worker.sent.some((msg) => msg.kind === "interruptGenerate")).toBe(
     true,
   );
+});
+
+test("WebWorkerMLCEngine resumable helpers delegate to worker", async () => {
+  const worker = new MockWorker();
+  worker.setResponder("resumeChatCompletion", () => ({
+    sessionId: "s1",
+    recoveredText: "hello",
+    emittedTokens: 1,
+    processedSeqLen: 2,
+    replayedTokens: 0,
+    recoveryMode: "text_only",
+  }));
+  const engine = new WebWorkerMLCEngine(worker as any);
+
+  await expect(engine.listResumableSessions()).resolves.toEqual([]);
+  await expect(engine.resumeChatCompletion("s1")).resolves.toMatchObject({
+    sessionId: "s1",
+    recoveredText: "hello",
+  });
+  await expect(engine.deleteResumableSession("s1")).resolves.toBeUndefined();
+  expect(worker.sent.some((msg) => msg.kind === "listResumableSessions")).toBe(
+    true,
+  );
+  expect(worker.sent.some((msg) => msg.kind === "resumeChatCompletion")).toBe(
+    true,
+  );
+  expect(worker.sent.some((msg) => msg.kind === "deleteResumableSession")).toBe(
+    true,
+  );
+});
+
+test("WebWorkerMLCEngine resumeChatCompletion can return resumed stream", async () => {
+  const worker = new MockWorker();
+  let nextCount = 0;
+  worker.setResponder("resumeChatCompletionStreamInit", () => null);
+  worker.setResponder("completionStreamNextChunk", () => {
+    nextCount++;
+    return nextCount === 1
+      ? {
+          object: "chat.completion.chunk",
+          choices: [{ delta: { content: "x" } }],
+        }
+      : undefined;
+  });
+  const engine = new WebWorkerMLCEngine(worker as any);
+
+  const result = await engine.resumeChatCompletion("s1", {
+    continueGeneration: true,
+    stream: true,
+  });
+  const chunks = [];
+  for await (const chunk of result as AsyncIterable<any>) {
+    chunks.push(chunk);
+  }
+
+  expect(chunks).toHaveLength(1);
+  expect(
+    worker.sent.some((msg) => msg.kind === "resumeChatCompletionStreamInit"),
+  ).toBe(true);
+  const init = worker.sent.find(
+    (msg) => msg.kind === "resumeChatCompletionStreamInit",
+  );
+  expect(
+    worker.sent.some(
+      (msg) =>
+        msg.kind === "completionStreamNextChunk" &&
+        msg.content.streamId === init.content.streamId,
+    ),
+  ).toBe(true);
+});
+
+test("WebWorkerMLCEngine return cancels a resumed stream before first next", async () => {
+  const worker = new MockWorker();
+  worker.setResponder("resumeChatCompletionStreamInit", () => null);
+  const engine = new WebWorkerMLCEngine(worker as any);
+
+  const stream = (await engine.resumeChatCompletion("s-cancel", {
+    continueGeneration: true,
+    stream: true,
+  })) as AsyncIterableIterator<any>;
+  await stream.return!();
+
+  const init = worker.sent.find(
+    (msg) => msg.kind === "resumeChatCompletionStreamInit",
+  );
+  expect(worker.sent).toContainEqual(
+    expect.objectContaining({
+      kind: "completionStreamReturn",
+      content: { streamId: init.content.streamId },
+    }),
+  );
+});
+
+test("WebWorkerMLCEngine gives concurrent streams distinct ids", async () => {
+  const worker = new MockWorker();
+  worker.setResponder("resumeChatCompletionStreamInit", () => null);
+  const engine = new WebWorkerMLCEngine(worker as any);
+
+  const first = (await engine.resumeChatCompletion("s-one", {
+    continueGeneration: true,
+    stream: true,
+  })) as AsyncIterableIterator<any>;
+  const second = (await engine.resumeChatCompletion("s-two", {
+    continueGeneration: true,
+    stream: true,
+  })) as AsyncIterableIterator<any>;
+  const ids = worker.sent
+    .filter((msg) => msg.kind === "resumeChatCompletionStreamInit")
+    .map((msg) => msg.content.streamId);
+
+  expect(new Set(ids).size).toBe(2);
+  await first.return!();
+  await second.return!();
 });
 
 test.each(["chatCompletion", "completion"] as const)(

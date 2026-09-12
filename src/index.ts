@@ -28,6 +28,10 @@ export {
   MLCEngineInterface,
   LogitProcessor,
   LogLevel,
+  ResumableGenerationConfig,
+  ResumeChatCompletionOptions,
+  ResumeProbeResult,
+  ResumeResult,
 } from "./types";
 
 export { MLCEngine, CreateMLCEngine } from "./engine";

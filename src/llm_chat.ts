@@ -58,6 +58,114 @@ type ResolvedModelABI = {
   needsRNNState: boolean;
 };
 
+type CommitTokenSource = "prefill" | "decode";
+
+const KV_CHECKPOINT_FUNC_NAMES = [
+  "vm.builtin.attention_kv_cache_get_checkpoint_metadata",
+  "vm.builtin.attention_kv_cache_export_page_group",
+  "vm.builtin.attention_kv_cache_prepare_import",
+  "vm.builtin.attention_kv_cache_import_page_group",
+  "vm.builtin.attention_kv_cache_finish_import",
+  "vm.builtin.attention_kv_cache_get_sequence_length",
+] as const;
+
+type ForwardPrefillResult = {
+  logits: tvmjs.Tensor;
+  promptLen: number;
+  promptTokenIds?: number[];
+  assistantPrefixTokenIds: number[];
+};
+
+export interface KVCheckpointPageGroupData {
+  groupId: number;
+  layerStart: number;
+  layerEnd: number;
+  data: Uint8Array;
+}
+
+export interface KVCheckpointLogitsData {
+  shape: number[];
+  dtype: string;
+  data: Uint8Array;
+}
+
+export interface KVCheckpointData {
+  processedSeqLen: number;
+  layoutHash?: string;
+  metadata: Record<string, unknown>;
+  pageGroups: KVCheckpointPageGroupData[];
+  nextLogits?: KVCheckpointLogitsData;
+}
+
+export interface KVCheckpointReplayResult {
+  replayedTokens: number;
+  sampledFromCheckpointLogits: boolean;
+  sampledToken?: SampledGenerationStep;
+  committedToken?: CommittedGenerationStep;
+}
+
+export interface SamplePrefillOptions {
+  capturePromptCheckpoint?: boolean;
+  storeCheckpointLogits?: boolean;
+}
+
+export interface SampleDecodeOptions {
+  captureCheckpoint?: boolean;
+  storeCheckpointLogits?: boolean;
+}
+
+interface KVCheckpointGroupInfo {
+  groupId: number;
+  layerStart: number;
+  layerEnd: number;
+  shape: number[];
+  dtype: string;
+}
+
+export interface SampledGenerationStep {
+  source: CommitTokenSource;
+  tokenId: number;
+  globalTokenPos: number;
+  promptLen?: number;
+  promptTokenIds?: number[];
+  assistantPrefixTokenIds?: number[];
+  promptCheckpoint?: KVCheckpointData;
+  decodeCheckpoint?: KVCheckpointData;
+  logprob?: ChatCompletionTokenLogprob;
+}
+
+export interface CommittedGenerationStep {
+  source: CommitTokenSource;
+  tokenId: number;
+  globalTokenPos: number;
+  textDelta: string;
+  textPrefixLength: number;
+  outputMessage: string;
+  stopped: boolean;
+  finishReason?: ChatCompletionFinishReason;
+}
+
+export interface ReplayedGenerationToken {
+  globalTokenPos: number;
+  tokenId: number;
+  textDelta: string;
+  textPrefixLength?: number;
+  rngState?: unknown;
+}
+
+function commonPrefixLength(lhs: string, rhs: string): number {
+  const limit = Math.min(lhs.length, rhs.length);
+  let prefixLength = 0;
+  while (prefixLength < limit && lhs[prefixLength] === rhs[prefixLength]) {
+    prefixLength++;
+  }
+  return prefixLength;
+}
+
+function errorMessage(err: unknown): string {
+  return err instanceof Error ? err.message : String(err);
+}
+
 export class LLMChatPipeline {
   private config: ChatConfig;
   private tokenizer: Tokenizer;
@@ -91,6 +199,8 @@ export class LLMChatPipeline {
   private params: tvmjs.TVMObject;
   private kvCache?: tvmjs.TVMObject = undefined;
   private rnnState?: tvmjs.TVMObject = undefined;
+  private kvCheckpointFuncs = new Map<string, tvmjs.PackedFunc>();
+  private kvCheckpointUnavailableReason?: string;
   private prefillLogitPositions?: tvmjs.Tensor = undefined;
   private prefillLogitPositionHost = new Int32Array(1);
   private maxHistorySize = 1;
@@ -131,6 +241,7 @@ export class LLMChatPipeline {
   private curRoundPrefillTotalTokens = 0;
   private curRoundDecodingTotalTime = 0;
   private curRoundPrefillTotalTime = 0;
+  private pendingSampleOutputTokenBegin?: number = undefined;
 
   // additional stats, reset at every prefillStep()
   public curRoundLatencyBreakdown: LatencyBreakdown = {
@@ -497,6 +608,10 @@ export class LLMChatPipeline {
     this.kvCache?.dispose();
     this.fsampleWithTopP.dispose();
     this.fargsortProbs.dispose();
+    for (const func of this.kvCheckpointFuncs.values()) {
+      func.dispose();
+    }
+    this.kvCheckpointFuncs.clear();
     this.sampleIndicesDevice?.dispose();
     this.topPDevice?.dispose();
     this.vm.dispose();
@@ -696,6 +811,126 @@ export class LLMChatPipeline {
     return undefined;
   }
 
+  private isGrammarConstrained(
+    responseFormat?: ResponseFormat | null,
+  ): boolean {
+    return (
+      responseFormat?.type === "json_object" ||
+      responseFormat?.type === "grammar" ||
+      responseFormat?.type === "structural_tag"
+    );
+  }
+
+  private resetGenerationRoundState(): void {
+    this.outputIds = [];
+    this.appearedTokensFreq.clear();
+    this.outputMessage = "";
+    this.tokenLogprobArray = [];
+    this.curRoundDecodingTotalTokens = 0;
+    this.curRoundPrefillTotalTokens = 0;
+    this.curRoundPrefillTotalTime = 0;
+    this.curRoundDecodingTotalTime = 0;
+    this.curRoundGrammarInitTotalTime = 0;
+    this.curRoundGrammarPerTokenTotalTime = 0;
+    this.pendingSampleOutputTokenBegin = undefined;
+
+    this.curRoundLatencyBreakdown = {
+      logitProcessorTime: [],
+      logitBiasTime: [],
+      penaltyTime: [],
+      sampleTime: [],
+      totalTime: [],
+      grammarBitmaskTime: [],
+    };
+  }
+
+  private prepareGrammarMatcherForSampling(
+    genConfig?: GenerationConfig,
+  ): Promise<void> | undefined {
+    const responseFormat = genConfig?.response_format;
+    if (
+      responseFormat === undefined ||
+      responseFormat === null ||
+      !this.isGrammarConstrained(responseFormat)
+    ) {
+      return undefined;
+    }
+
+    const curResponseFormatKey = this.getResponseFormatKey(responseFormat);
+    if (
+      curResponseFormatKey === this.responseFormatCacheKey &&
+      this.grammarMatcher
+    ) {
+      // If we did not change the schema and have instantiated a GrammarMatcher, we reuse it.
+      const tGrammarInitStart = performance.now();
+      log.info("Reuse grammar matcher.");
+      this.grammarMatcher.reset();
+      this.curRoundGrammarInitTotalTime =
+        (performance.now() - tGrammarInitStart) / 1e3;
+      return undefined;
+    }
+
+    // Else dispose current grammarMatcher, reinitialize, and update this.schema.
+    const initialization = (async () => {
+      const tGrammarInitStart = performance.now();
+      log.info("Initialize new grammar matcher.");
+      try {
+        if (this.grammarMatcher) {
+          this.grammarMatcher.dispose();
+          this.grammarMatcher = undefined;
+        }
+        if (this.xgTokenizerInfo === undefined) {
+          log.info("Initialize token table.");
+          // Post process entire table
+          const rawTokenTable = getTokenTableFromTokenizer(this.tokenizer);
+          this.xgTokenizerInfo = await xgr.TokenizerInfo.createTokenizerInfo(
+            rawTokenTable,
+            this.token_postproc_method,
+            this.prepend_space_in_encode,
+            this.fullVocabSize,
+            this.stopTokens,
+          );
+          this.grammarCompiler =
+            await xgr.GrammarCompiler.createGrammarCompiler(
+              this.xgTokenizerInfo,
+            );
+        }
+        const grammar: xgr.CompiledGrammar =
+          responseFormat.type === undefined
+            ? await this.grammarCompiler!.compileBuiltinJSONGrammar()
+            : responseFormat.type === "json_object"
+              ? await this.grammarCompiler!.compileJSONSchema(
+                  responseFormat.schema!,
+                )
+              : responseFormat.type === "grammar"
+                ? await this.grammarCompiler!.compileGrammar(
+                    responseFormat.grammar!,
+                  )
+                : await this.grammarCompiler!.compileStructuralTag(
+                    responseFormat.structural_tag!,
+                  );
+        try {
+          this.grammarMatcher =
+            await xgr.GrammarMatcher.createGrammarMatcher(grammar);
+        } finally {
+          grammar.dispose();
+        }
+        this.responseFormatCacheKey = curResponseFormatKey;
+        this.curRoundGrammarInitTotalTime =
+          (performance.now() - tGrammarInitStart) / 1e3;
+      } catch (err) {
+        throw new GrammarMatcherInitError(
+          responseFormat.type ?? "json_object",
+          err,
+        );
+      }
+    })();
+    // Observe failures immediately while prefill is still in flight. Awaiting the
+    // original promise below still propagates the initialization error.
+    void initialization.catch(() => undefined);
+    return initialization;
+  }
+
   // Getters and setters for this.conversation.
   /**
    * @returns The conversation object (not a deep copy).
@@ -731,130 +966,102 @@ export class LLMChatPipeline {
         "The last message should be from `user` or `tool`.",
       );
     }
+
+    const step = await this.samplePrefillStep(
+      inp,
+      msgRole,
+      inp_role_str,
+      genConfig,
+    );
+    this.commitSampledStep(step, genConfig);
+  }
+
+  async samplePrefillStep(
+    inp: string,
+    msgRole: Role,
+    inp_role_str?: string,
+    genConfig?: GenerationConfig,
+    opts: SamplePrefillOptions = {},
+  ): Promise<SampledGenerationStep> {
+    if (msgRole !== Role.user && msgRole !== Role.tool) {
+      throw new MessageOrderError(
+        "The last message should be from `user` or `tool`.",
+      );
+    }
     if (this.resetStatsPerPrefill) {
       this.resetRuntimeStats();
     }
 
     const tstart = performance.now();
-
-    // cleanup the per convo states
-    this.outputIds = [];
-    this.appearedTokensFreq.clear();
-    this.outputMessage = "";
-    this.tokenLogprobArray = [];
-    this.curRoundDecodingTotalTokens = 0;
-    this.curRoundPrefillTotalTokens = 0;
-    this.curRoundPrefillTotalTime = 0;
-    this.curRoundDecodingTotalTime = 0;
-    this.curRoundGrammarInitTotalTime = 0;
-    this.curRoundGrammarPerTokenTotalTime = 0;
-
-    this.curRoundLatencyBreakdown = {
-      logitProcessorTime: [],
-      logitBiasTime: [],
-      penaltyTime: [],
-      sampleTime: [],
-      totalTime: [],
-      grammarBitmaskTime: [],
-    };
-
+    this.resetGenerationRoundState();
     this.stopTriggered = false;
-    const conversation = this.conversation;
 
     // -1. Instantiate grammar matcher according to generation config. This step is overlapped
     // with prefilling the prompt to hide overhead by using this promise.
-    let grammarMatcherInitPromise: Promise<void> | undefined = undefined;
-    const responseFormat = genConfig?.response_format;
-    if (
-      responseFormat?.type === "json_object" ||
-      responseFormat?.type === "grammar" ||
-      responseFormat?.type === "structural_tag"
-    ) {
-      const curResponseFormatKey = this.getResponseFormatKey(responseFormat);
-      if (
-        curResponseFormatKey === this.responseFormatCacheKey &&
-        this.grammarMatcher
-      ) {
-        // If we did not change the schema and have instantiated a GrammarMatcher, we reuse it.
-        const tGrammarInitStart = performance.now();
-        log.info("Reuse grammar matcher.");
-        this.grammarMatcher.reset();
-        this.curRoundGrammarInitTotalTime =
-          (performance.now() - tGrammarInitStart) / 1e3;
-      } else {
-        // Else dispose current grammarMatcher, reinitialize, and update this.schema.
-        grammarMatcherInitPromise = (async () => {
-          const tGrammarInitStart = performance.now();
-          log.info("Initialize new grammar matcher.");
-          try {
-            if (this.grammarMatcher) {
-              this.grammarMatcher.dispose();
-              this.grammarMatcher = undefined;
-            }
-            if (this.xgTokenizerInfo === undefined) {
-              log.info("Initialize token table.");
-              // Post process entire table
-              const rawTokenTable = getTokenTableFromTokenizer(this.tokenizer);
-              this.xgTokenizerInfo =
-                await xgr.TokenizerInfo.createTokenizerInfo(
-                  rawTokenTable,
-                  this.token_postproc_method,
-                  this.prepend_space_in_encode,
-                  this.fullVocabSize,
-                  this.stopTokens,
-                );
-              this.grammarCompiler =
-                await xgr.GrammarCompiler.createGrammarCompiler(
-                  this.xgTokenizerInfo,
-                );
-            }
-            const grammar: xgr.CompiledGrammar =
-              responseFormat.type === undefined
-                ? await this.grammarCompiler!.compileBuiltinJSONGrammar()
-                : responseFormat.type === "json_object"
-                  ? await this.grammarCompiler!.compileJSONSchema(
-                      responseFormat.schema!,
-                    )
-                  : responseFormat.type === "grammar"
-                    ? await this.grammarCompiler!.compileGrammar(
-                        responseFormat.grammar!,
-                      )
-                    : await this.grammarCompiler!.compileStructuralTag(
-                        responseFormat.structural_tag!,
-                      );
-            try {
-              this.grammarMatcher =
-                await xgr.GrammarMatcher.createGrammarMatcher(grammar);
-            } finally {
-              grammar.dispose();
-            }
-            this.responseFormatCacheKey = curResponseFormatKey;
-            this.curRoundGrammarInitTotalTime =
-              (performance.now() - tGrammarInitStart) / 1e3;
-          } catch (err) {
-            throw new GrammarMatcherInitError(
-              responseFormat.type ?? "json_object",
-              err,
-            );
-          }
-        })();
-        // Grammar initialization overlaps prompt prefill, so attach a handler now. The original
-        // promise still rejects when awaited below, but browsers will not report it as unhandled
-        // if initialization fails before prefill finishes.
-        void grammarMatcherInitPromise.catch(() => undefined);
-      }
+    const grammarMatcherInitPromise =
+      this.prepareGrammarMatcherForSampling(genConfig);
+    const { logits, promptLen, promptTokenIds, assistantPrefixTokenIds } =
+      await this.forwardPrefill(inp, msgRole, inp_role_str, genConfig);
+    let promptCheckpoint: KVCheckpointData | undefined;
+    let nextToken: number;
+    try {
+      promptCheckpoint =
+        opts.capturePromptCheckpoint === true
+          ? await this.tryExportPromptCheckpoint(
+              logits,
+              opts.storeCheckpointLogits !== false,
+            )
+          : undefined;
+
+      // 4. Sample, stats, post process token sampled.
+      // We wait for prefill and grammar matcher init to finish
+      await this.device.sync();
+      await grammarMatcherInitPromise;
+      nextToken = await this.sampleFromRawLogits(logits, genConfig);
+    } finally {
+      logits.dispose();
     }
+    const tend = performance.now();
+
+    this.prefillTotalTime += (tend - tstart) / 1e3;
+    this.prefillTotalTokens += promptLen;
+    this.curRoundPrefillTotalTokens += promptLen;
+    this.curRoundPrefillTotalTime += (tend - tstart) / 1e3;
+
+    return {
+      source: "prefill",
+      tokenId: nextToken,
+      globalTokenPos: this.filledKVCacheLength,
+      promptLen,
+      promptTokenIds,
+      assistantPrefixTokenIds,
+      promptCheckpoint,
+      logprob: this.tokenLogprobArray.at(-1),
+    };
+  }
+
+  private async forwardPrefill(
+    inp: string,
+    msgRole: Role,
+    inpRoleStr?: string,
+    genConfig?: GenerationConfig,
+  ): Promise<ForwardPrefillResult> {
+    const conversation = this.conversation;
+    const assistantPrefixTokenIds: number[] = [];
 
     // 0. Get inputData from conversation
     if (conversation.isTextCompletion) {
       conversation.prompt = inp;
     } else {
-      conversation.appendMessage(msgRole, inp, inp_role_str);
+      conversation.appendMessage(msgRole, inp, inpRoleStr);
       if (genConfig?.enable_thinking === false) {
         // TODO(Charlie): In future we should make emptyThinkingBlockStr configurable.
         const emptyThinkingBlockStr = "<think>\n\n</think>\n\n";
-        const encoded = this.tokenizer.encode(emptyThinkingBlockStr);
+        const encoded = Array.from(
+          this.tokenizer.encode(emptyThinkingBlockStr),
+        );
         this.outputIds.push(...encoded);
+        assistantPrefixTokenIds.push(...encoded);
         conversation.appendEmptyThinkingReplyHeader(
           Role.assistant,
           emptyThinkingBlockStr,
@@ -864,6 +1071,9 @@ export class LLMChatPipeline {
       }
     }
     const [inputData, promptLen, getEmbedSize] = await this.getInputData();
+    const promptTokenIds = inputData.every((data) => Array.isArray(data))
+      ? inputData.flatMap((data) => data as number[])
+      : undefined;
 
     // Check if LLMChatPipeline fits for forwarding image input
     const hasImageInput = inputData.some((data) => !Array.isArray(data));
@@ -882,42 +1092,59 @@ export class LLMChatPipeline {
 
     // 2. Prefill each chunk
     this.tvm.beginScope();
-    let logits: tvmjs.Tensor;
-    for (let i = 0; i < chunks.length; i++) {
-      const chunk = chunks[i];
-      const chunkLen = chunkLens[i];
+    let logits: tvmjs.Tensor | undefined;
+    try {
+      for (let i = 0; i < chunks.length; i++) {
+        const chunk = chunks[i];
+        const chunkLen = chunkLens[i];
+        const prevFilledLen = this.filledKVCacheLength;
+        const chunkLogits = await this.embedAndForward(chunk, chunkLen);
+        if (this.filledKVCacheLength !== prevFilledLen + chunkLen) {
+          throw new Error(
+            "Internal Error: filledKVCacheLength does not match expected value.",
+          );
+        }
+        if (i === chunks.length - 1) {
+          logits = this.tvm.detachFromCurrentScope(chunkLogits);
+        }
+      }
+    } finally {
+      this.imageDataCache.clear();
+      this.tvm.endScope();
+    }
+
+    if (logits === undefined) {
+      throw new Error("Internal Error: prefill did not produce logits.");
+    }
+
+    return {
+      logits,
+      promptLen,
+      promptTokenIds,
+      assistantPrefixTokenIds,
+    };
+  }
+
+  private async forwardDecodeToken(tokenId: number): Promise<tvmjs.Tensor> {
+    if (tokenId === undefined) {
+      throw new Error("Internal Error: missing decode token.");
+    }
+
+    this.tvm.beginScope();
+    try {
+      const chunk: Array<Array<number>> = [[tokenId]];
+      const chunkLen = 1;
       const prevFilledLen = this.filledKVCacheLength;
-      logits = this.tvm.detachFromCurrentScope(
-        await this.embedAndForward(chunk, chunkLen),
-      );
+      const logits = await this.embedAndForward(chunk, chunkLen);
       if (this.filledKVCacheLength !== prevFilledLen + chunkLen) {
         throw new Error(
           "Internal Error: filledKVCacheLength does not match expected value.",
         );
       }
-    }
-    this.imageDataCache.clear();
-    this.tvm.endScope();
-
-    // 4. Sample, stats, post process token sampled.
-    // Grammar initialization has already been running alongside prefill. Wait for the GPU first
-    // so logits can be disposed safely even when grammar initialization fails.
-    let nextToken: number;
-    try {
-      await this.device.sync();
-      await grammarMatcherInitPromise;
-      nextToken = await this.sampleTokenFromLogits(logits!, genConfig);
+      return this.tvm.detachFromCurrentScope(logits);
     } finally {
-      logits!.dispose();
+      this.tvm.endScope();
     }
-    const tend = performance.now();
-
-    this.prefillTotalTime += (tend - tstart) / 1e3;
-    this.prefillTotalTokens += promptLen;
-    this.curRoundPrefillTotalTokens += promptLen;
-    this.curRoundPrefillTotalTime += (tend - tstart) / 1e3;
-
-    this.processNextToken(nextToken, genConfig);
   }
 
   async decodeStep(genConfig?: GenerationConfig): Promise<void> {
@@ -925,27 +1152,38 @@ export class LLMChatPipeline {
       throw Error("Cannot run decode when stopped");
     }
 
+    const step = await this.sampleDecodeStep(genConfig);
+    this.commitSampledStep(step, genConfig);
+  }
+
+  async sampleDecodeStep(
+    genConfig?: GenerationConfig,
+    opts: SampleDecodeOptions = {},
+  ): Promise<SampledGenerationStep> {
+    if (this.stopTriggered) {
+      throw Error("Cannot run decode when stopped");
+    }
+
     const tstart = performance.now();
 
-    this.tvm.beginScope();
-    const chunk: Array<Array<number>> = [
-      this.outputIds.slice(this.outputIds.length - 1),
-    ];
-    const chunkLen = chunk.length;
-    const prevFilledLen = this.filledKVCacheLength;
-    const logits = this.tvm.detachFromCurrentScope(
-      await this.embedAndForward(chunk, chunkLen),
-    );
-    if (this.filledKVCacheLength !== prevFilledLen + chunkLen) {
-      throw new Error(
-        "Internal Error: filledKVCacheLength does not match expected value.",
-      );
-    }
-    this.tvm.endScope();
+    const lastToken = this.outputIds[this.outputIds.length - 1];
+    const logits = await this.forwardDecodeToken(lastToken);
+    let decodeCheckpoint: KVCheckpointData | undefined;
+    let nextToken: number;
+    try {
+      decodeCheckpoint =
+        opts.captureCheckpoint === true
+          ? await this.tryExportPromptCheckpoint(
+              logits,
+              opts.storeCheckpointLogits !== false,
+            )
+          : undefined;
 
-    // sample from logits
-    const nextToken = await this.sampleTokenFromLogits(logits, genConfig);
-    logits.dispose();
+      // sample from logits
+      nextToken = await this.sampleFromRawLogits(logits, genConfig);
+    } finally {
+      logits.dispose();
+    }
     const tend = performance.now();
 
     this.decodingTotalTime += (tend - tstart) / 1e3;
@@ -953,7 +1191,13 @@ export class LLMChatPipeline {
     this.curRoundDecodingTotalTokens += 1;
     this.curRoundDecodingTotalTime += (tend - tstart) / 1e3;
 
-    this.processNextToken(nextToken, genConfig);
+    return {
+      source: "decode",
+      tokenId: nextToken,
+      globalTokenPos: this.filledKVCacheLength,
+      decodeCheckpoint,
+      logprob: this.tokenLogprobArray.at(-1),
+    };
   }
 
   /**
@@ -979,6 +1223,7 @@ export class LLMChatPipeline {
   private processNextToken(
     nextToken: number,
     genConfig?: GenerationConfig,
+    processedSeqLen = this.filledKVCacheLength,
   ): void {
     if (this.stopTriggered) {
       throw Error("Cannot call process when it is stoppped");
@@ -1054,7 +1299,7 @@ export class LLMChatPipeline {
     // Stop condition 4: exceed KVCache's context window size
     if (
       this.slidingWindowSize == -1 &&
-      this.filledKVCacheLength == this.contextWindowSize
+      processedSeqLen == this.contextWindowSize
     ) {
       this.stopTriggered = true;
       this.finishReason = "length";
@@ -1067,6 +1312,391 @@ export class LLMChatPipeline {
         this.conversation.finishReply(this.outputMessage);
       }
     }
+  }
+
+  private commitSampledToken(
+    nextToken: number,
+    genConfig: GenerationConfig | undefined,
+    source: CommitTokenSource,
+  ): void {
+    switch (source) {
+      case "prefill":
+      case "decode":
+        this.commitSamplerState(nextToken, genConfig);
+        this.processNextToken(nextToken, genConfig);
+        return;
+    }
+  }
+
+  commitSampledStep(
+    step: SampledGenerationStep,
+    genConfig?: GenerationConfig,
+  ): CommittedGenerationStep {
+    const prevOutputMessage = this.outputMessage;
+    this.commitSampledToken(step.tokenId, genConfig, step.source);
+    const textPrefixLength = commonPrefixLength(
+      prevOutputMessage,
+      this.outputMessage,
+    );
+    const textDelta = this.outputMessage.slice(textPrefixLength);
+    return {
+      source: step.source,
+      tokenId: step.tokenId,
+      globalTokenPos: step.globalTokenPos,
+      textDelta,
+      textPrefixLength,
+      outputMessage: this.outputMessage,
+      stopped: this.stopTriggered,
+      finishReason: this.finishReason,
+    };
+  }
+
+  getRNGState(): unknown {
+    return (this.tvm as any).getRNGState?.();
+  }
+
+  setRNGState(state: unknown): boolean {
+    const setRNGState = (this.tvm as any).setRNGState;
+    if (setRNGState === undefined) {
+      return false;
+    }
+    setRNGState.call(this.tvm, state);
+    return true;
+  }
+
+  private getKVCheckpointFunc(name: string): tvmjs.PackedFunc {
+    const cached = this.kvCheckpointFuncs.get(name);
+    if (cached !== undefined) {
+      return cached;
+    }
+    this.tvm.beginScope();
+    try {
+      const func = this.tvm.detachFromCurrentScope(
+        this.tvm.getGlobalFunc(name),
+      );
+      this.kvCheckpointFuncs.set(name, func);
+      return func;
+    } finally {
+      this.tvm.endScope();
+    }
+  }
+
+  private resolveKVCheckpointFuncs(): void {
+    for (const name of KV_CHECKPOINT_FUNC_NAMES) {
+      this.getKVCheckpointFunc(name);
+    }
+  }
+
+  private async tryExportPromptCheckpoint(
+    logits: tvmjs.Tensor,
+    storeCheckpointLogits: boolean,
+  ): Promise<KVCheckpointData | undefined> {
+    if (this.kvCache === undefined || this.kvStateKind !== "kv_cache") {
+      return undefined;
+    }
+    if (this.kvCheckpointUnavailableReason !== undefined) {
+      return undefined;
+    }
+    try {
+      this.resolveKVCheckpointFuncs();
+      return await this.exportPromptCheckpoint(logits, storeCheckpointLogits);
+    } catch (err) {
+      this.kvCheckpointUnavailableReason = errorMessage(err);
+      log.warn(
+        `KV checkpoint capture disabled for this model: ${this.kvCheckpointUnavailableReason}`,
+      );
+      return undefined;
+    }
+  }
+
+  private copyTensorRawBytes(tensor: tvmjs.Tensor): Uint8Array {
+    return tensor.toRawBytes();
+  }
+
+  private async copyTensorToCPUBytes(
+    tensor: tvmjs.Tensor,
+  ): Promise<Uint8Array> {
+    this.tvm.beginScope();
+    try {
+      const cpuTensor = this.tvm.empty(
+        tensor.shape,
+        tensor.dtype,
+        this.tvm.cpu(),
+      );
+      cpuTensor.copyFrom(tensor);
+      await this.device.sync();
+      return this.copyTensorRawBytes(cpuTensor);
+    } finally {
+      this.tvm.endScope();
+    }
+  }
+
+  private checkpointGroupInfo(group: unknown): KVCheckpointGroupInfo {
+    const value = group as Record<string, unknown>;
+    const groupId = value.group_index ?? value.groupIndex;
+    const layerStart = value.layer_begin ?? value.layerBegin;
+    const layerEnd = value.layer_end ?? value.layerEnd;
+    const shape = value.shape;
+    const dtype = value.dtype;
+    if (
+      typeof groupId !== "number" ||
+      !Number.isInteger(groupId) ||
+      typeof layerStart !== "number" ||
+      !Number.isInteger(layerStart) ||
+      typeof layerEnd !== "number" ||
+      !Number.isInteger(layerEnd) ||
+      !Array.isArray(shape) ||
+      !shape.every(Number.isInteger) ||
+      typeof dtype !== "string"
+    ) {
+      throw new Error("Invalid KV checkpoint group metadata.");
+    }
+    return {
+      groupId,
+      layerStart,
+      layerEnd,
+      shape: shape as number[],
+      dtype,
+    };
+  }
+
+  async exportPromptCheckpoint(
+    logits: tvmjs.Tensor,
+    storeCheckpointLogits: boolean,
+  ): Promise<KVCheckpointData | undefined> {
+    if (this.kvCache === undefined || this.kvStateKind !== "kv_cache") {
+      return undefined;
+    }
+
+    const seqId = new tvmjs.Scalar(0, "int64");
+    const getMetadata = this.getKVCheckpointFunc(
+      "vm.builtin.attention_kv_cache_get_checkpoint_metadata",
+    );
+    const metadata = JSON.parse(
+      String(getMetadata(this.kvCache, seqId)),
+    ) as Record<string, unknown>;
+    const groups = metadata.groups;
+    if (!Array.isArray(groups)) {
+      throw new Error("KV checkpoint metadata is missing page groups.");
+    }
+
+    const exportPageGroup = this.getKVCheckpointFunc(
+      "vm.builtin.attention_kv_cache_export_page_group",
+    );
+    const pageGroups: KVCheckpointPageGroupData[] = [];
+    for (const group of groups) {
+      const info = this.checkpointGroupInfo(group);
+      this.tvm.beginScope();
+      try {
+        const dst = this.tvm.empty(info.shape, info.dtype, this.device);
+        exportPageGroup(
+          this.kvCache,
+          seqId,
+          new tvmjs.Scalar(info.groupId, "int64"),
+          dst,
+        );
+        pageGroups.push({
+          groupId: info.groupId,
+          layerStart: info.layerStart,
+          layerEnd: info.layerEnd,
+          data: await this.copyTensorToCPUBytes(dst),
+        });
+      } finally {
+        this.tvm.endScope();
+      }
+    }
+
+    const seqLength = metadata.seq_length ?? metadata.seqLength;
+    const metadataLayoutHash = metadata.layout_hash ?? metadata.layoutHash;
+    const processedSeqLen =
+      typeof seqLength === "number" ? seqLength : this.filledKVCacheLength;
+    return {
+      processedSeqLen,
+      layoutHash:
+        typeof metadataLayoutHash === "string" ? metadataLayoutHash : undefined,
+      metadata,
+      pageGroups,
+      nextLogits: storeCheckpointLogits
+        ? {
+            shape: [...logits.shape],
+            dtype: logits.dtype,
+            data: await this.copyTensorToCPUBytes(logits),
+          }
+        : undefined,
+    };
+  }
+
+  private async importPromptCheckpoint(
+    checkpoint: KVCheckpointData,
+  ): Promise<void> {
+    if (this.kvCache === undefined || this.kvStateKind !== "kv_cache") {
+      throw new Error("KV checkpoint import requires a pure KV cache.");
+    }
+    const seqId = new tvmjs.Scalar(0, "int64");
+    const prepareImport = this.getKVCheckpointFunc(
+      "vm.builtin.attention_kv_cache_prepare_import",
+    );
+    prepareImport(this.kvCache, seqId, JSON.stringify(checkpoint.metadata));
+
+    const groups = checkpoint.metadata.groups;
+    if (!Array.isArray(groups)) {
+      throw new Error("KV checkpoint metadata is missing page groups.");
+    }
+    const groupInfo = new Map<number, KVCheckpointGroupInfo>();
+    for (const group of groups) {
+      const info = this.checkpointGroupInfo(group);
+      groupInfo.set(info.groupId, info);
+    }
+
+    const importPageGroup = this.getKVCheckpointFunc(
+      "vm.builtin.attention_kv_cache_import_page_group",
+    );
+    for (const group of checkpoint.pageGroups) {
+      const info = groupInfo.get(group.groupId);
+      if (info === undefined) {
+        throw new Error(
+          `Missing metadata for KV checkpoint group ${group.groupId}.`,
+        );
+      }
+      this.tvm.beginScope();
+      try {
+        const src = this.tvm.empty(info.shape, info.dtype, this.device);
+        src.copyFromRawBytes(group.data);
+        importPageGroup(
+          this.kvCache,
+          seqId,
+          new tvmjs.Scalar(group.groupId, "int64"),
+          src,
+        );
+      } finally {
+        this.tvm.endScope();
+      }
+    }
+    const finishImport = this.getKVCheckpointFunc(
+      "vm.builtin.attention_kv_cache_finish_import",
+    );
+    finishImport(this.kvCache, seqId);
+    const getSequenceLength = this.getKVCheckpointFunc(
+      "vm.builtin.attention_kv_cache_get_sequence_length",
+    );
+    this.filledKVCacheLength = Number(getSequenceLength(this.kvCache, seqId));
+    await this.device.sync();
+  }
+
+  async replayFromPromptCheckpoint(
+    checkpoint: KVCheckpointData,
+    assistantPrefixTokenIds: number[],
+    coveredGeneratedTokens: ReplayedGenerationToken[],
+    tailGeneratedTokens: ReplayedGenerationToken[],
+    genConfig?: GenerationConfig,
+  ): Promise<KVCheckpointReplayResult> {
+    if (this.resetStatsPerPrefill) {
+      this.resetRuntimeStats();
+    }
+    this.resetChat();
+    this.setConversation(
+      getConversation(this.config.conv_template, this.config.conv_config, true),
+    );
+    this.resetGenerationRoundState();
+    this.stopTriggered = false;
+    this.finishReason = undefined;
+
+    const grammarMatcherInitPromise =
+      this.prepareGrammarMatcherForSampling(genConfig);
+    await this.importPromptCheckpoint(checkpoint);
+    await Promise.all([this.device.sync(), grammarMatcherInitPromise]);
+    if (this.filledKVCacheLength !== checkpoint.processedSeqLen) {
+      throw new Error(
+        `KV checkpoint sequence length mismatch: expected ${checkpoint.processedSeqLen}, got ${this.filledKVCacheLength}.`,
+      );
+    }
+
+    this.outputIds.push(...assistantPrefixTokenIds);
+    for (const token of coveredGeneratedTokens) {
+      // The imported cache already covers these tokens. Rebuild output and
+      // penalties using each token's original position for the context limit.
+      this.commitSamplerState(token.tokenId, genConfig);
+      this.processNextToken(token.tokenId, genConfig, token.globalTokenPos);
+    }
+
+    for (let i = 0; i < tailGeneratedTokens.length; i++) {
+      if (i > 0) {
+        const logits = await this.forwardDecodeToken(
+          tailGeneratedTokens[i - 1].tokenId,
+        );
+        logits.dispose();
+      }
+      this.commitSampledToken(
+        tailGeneratedTokens[i].tokenId,
+        genConfig,
+        "decode",
+      );
+    }
+
+    if (tailGeneratedTokens.length > 0) {
+      return {
+        replayedTokens: tailGeneratedTokens.length,
+        sampledFromCheckpointLogits: false,
+      };
+    }
+    if (checkpoint.nextLogits === undefined) {
+      throw new Error("Prompt checkpoint is missing next-token logits.");
+    }
+    this.tvm.beginScope();
+    try {
+      const logits = this.tvm.empty(
+        checkpoint.nextLogits.shape,
+        checkpoint.nextLogits.dtype,
+        this.device,
+      );
+      logits.copyFromRawBytes(checkpoint.nextLogits.data);
+      const tokenId = await this.sampleFromRawLogits(logits, genConfig);
+      const sampledToken: SampledGenerationStep = {
+        source: "prefill",
+        tokenId,
+        globalTokenPos: checkpoint.processedSeqLen,
+      };
+      const committedToken = this.commitSampledStep(sampledToken, genConfig);
+      return {
+        replayedTokens: 0,
+        sampledFromCheckpointLogits: true,
+        sampledToken,
+        committedToken,
+      };
+    } finally {
+      this.tvm.endScope();
+    }
+  }
+
+  private commitSamplerState(
+    sampledToken: number,
+    genConfig?: GenerationConfig,
+  ): void {
+    this.logitProcessor?.processSampledToken(sampledToken);
+
+    if (this.isGrammarConstrained(genConfig?.response_format)) {
+      if (this.grammarMatcher === undefined) {
+        throw Error("Expect grammar matcher to be initialized.");
+      }
+      const tAcceptStart = performance.now();
+      const accepted = this.grammarMatcher.acceptToken(sampledToken);
+      this.curRoundGrammarPerTokenTotalTime +=
+        (performance.now() - tAcceptStart) / 1e3;
+      if (!accepted) {
+        throw Error("Grammar matcher rejected the newly sampled token.");
+      }
+    }
+
+    if (
+      genConfig?.enable_latency_breakdown &&
+      this.pendingSampleOutputTokenBegin !== undefined
+    ) {
+      const outputTokenEnd = performance.now();
+      const outputTokenTimeSpent =
+        (outputTokenEnd - this.pendingSampleOutputTokenBegin) / 1e3;
+      this.curRoundLatencyBreakdown.totalTime.push(outputTokenTimeSpent);
+    }
+    this.pendingSampleOutputTokenBegin = undefined;
   }
 
   /**
@@ -1624,10 +2254,10 @@ export class LLMChatPipeline {
     return this.logitsOnCPU;
   }
 
-  private async sampleTokenFromLogits(
+  private async sampleFromRawLogits(
     logitsOnGPU: tvmjs.Tensor,
     genConfig?: GenerationConfig,
-  ) {
+  ): Promise<number> {
     // 0. Get value of temperature, top_p, and various penalties, possibly overridden by genConfig
     // Also load other genConfig items like logit_bias. Consume all fields of `genConfig` here.
     function _hasValue(value: any): boolean {
@@ -1710,10 +2340,8 @@ export class LLMChatPipeline {
     }
 
     const outputTokenBegin = performance.now();
-    const grammarConstrained =
-      response_format?.type === "json_object" ||
-      response_format?.type === "grammar" ||
-      response_format?.type === "structural_tag";
+    this.pendingSampleOutputTokenBegin = outputTokenBegin;
+    const grammarConstrained = this.isGrammarConstrained(response_format);
 
     // 0. Update logitsOnGPU with on-GPU grammar bitmasking
     if (grammarConstrained) {
@@ -1959,6 +2587,7 @@ export class LLMChatPipeline {
     sampledToken = sampledTokensHost.toArray()[0];
     sampledTokensHost.dispose();
     if (sampledToken < 0) {
+      this.pendingSampleOutputTokenBegin = undefined;
       throw new Error("InternalError: failed to sample a valid token.");
     }
 
@@ -1972,29 +2601,6 @@ export class LLMChatPipeline {
       const sampleEnd = performance.now();
       const sampleTimeSpent = (sampleEnd - sampleBegin) / 1e3;
       this.curRoundLatencyBreakdown.sampleTime.push(sampleTimeSpent);
-    }
-
-    // 5. Update logit processor
-    this.logitProcessor?.processSampledToken(sampledToken);
-
-    // 6. Update grammar matcher with new token
-    if (grammarConstrained) {
-      if (this.grammarMatcher === undefined) {
-        throw Error("Expect grammar matcher to be initialized.");
-      }
-      const tAcceptStart = performance.now();
-      const accepted = this.grammarMatcher.acceptToken(sampledToken);
-      this.curRoundGrammarPerTokenTotalTime +=
-        (performance.now() - tAcceptStart) / 1e3;
-      if (!accepted) {
-        throw Error("Grammar matcher rejected the newly sampled token.");
-      }
-    }
-
-    if (genConfig?.enable_latency_breakdown) {
-      const outputTokenEnd = performance.now();
-      const outputTokenTimeSpent = (outputTokenEnd - outputTokenBegin) / 1e3;
-      this.curRoundLatencyBreakdown.totalTime.push(outputTokenTimeSpent);
     }
 
     return sampledToken;
@@ -2177,7 +2783,8 @@ export class LLMChatPipeline {
     }
 
     // 3. Sample next token
-    const nextToken = await this.sampleTokenFromLogits(logitsOnGPU!);
+    const nextToken = await this.sampleFromRawLogits(logitsOnGPU!);
+    this.commitSamplerState(nextToken);
     this.tvm.endScope();
 
     // 4. Stats
@@ -2195,6 +2802,118 @@ export class LLMChatPipeline {
       this.curRoundDecodingTotalTime += (tend - tstart) / 1e3;
     }
     return nextToken;
+  }
+
+  private async forwardKnownTokens(
+    inputIds: Array<number>,
+    isPrefill: boolean,
+  ): Promise<tvmjs.Tensor | undefined> {
+    if (inputIds.length === 0) {
+      return undefined;
+    }
+    const tstart = performance.now();
+    this.tvm.beginScope();
+    const inputData: Array<Array<number>> = [inputIds];
+    const retGetChunks = getChunkedPrefillInputData(
+      inputData,
+      this.prefillChunkSize,
+      () => 0,
+    );
+    const chunks: Array<Array<number> | ImageURL>[] = retGetChunks[0];
+    const chunkLens: Array<number> = retGetChunks[1];
+
+    let lastLogits: tvmjs.Tensor | undefined;
+    try {
+      for (let i = 0; i < chunks.length; i++) {
+        const chunk = chunks[i];
+        const chunkLen = chunkLens[i];
+        const prevFilledLen = this.filledKVCacheLength;
+        const logits = await this.embedAndForward(chunk, chunkLen);
+        if (this.filledKVCacheLength !== prevFilledLen + chunkLen) {
+          throw new Error(
+            "Internal Error: filledKVCacheLength does not match expected value.",
+          );
+        }
+        if (i === chunks.length - 1) {
+          lastLogits = this.tvm.detachFromCurrentScope(logits);
+        }
+      }
+    } finally {
+      this.tvm.endScope();
+    }
+
+    const tend = performance.now();
+    if (isPrefill) {
+      this.prefillTotalTime += (tend - tstart) / 1e3;
+      this.prefillTotalTokens += inputIds.length;
+      this.curRoundPrefillTotalTokens += inputIds.length;
+      this.curRoundPrefillTotalTime += (tend - tstart) / 1e3;
+    }
+    return lastLogits;
+  }
+
+  async replayGenerationTokens(
+    promptTokenIds: number[],
+    assistantPrefixTokenIds: number[],
+    generatedTokens: ReplayedGenerationToken[],
+    genConfig?: GenerationConfig,
+  ): Promise<KVCheckpointReplayResult> {
+    if (this.resetStatsPerPrefill) {
+      this.resetRuntimeStats();
+    }
+    this.resetChat();
+    this.setConversation(
+      getConversation(this.config.conv_template, this.config.conv_config, true),
+    );
+    this.resetGenerationRoundState();
+    this.stopTriggered = false;
+    this.finishReason = undefined;
+
+    const grammarMatcherInitPromise =
+      this.prepareGrammarMatcherForSampling(genConfig);
+    const promptLogits = await this.forwardKnownTokens(promptTokenIds, true);
+    try {
+      await Promise.all([this.device.sync(), grammarMatcherInitPromise]);
+
+      this.outputIds.push(...assistantPrefixTokenIds);
+      if (generatedTokens.length === 0) {
+        if (promptLogits === undefined) {
+          throw new Error("Cannot resume from an empty prompt token record.");
+        }
+        const tokenId = await this.sampleFromRawLogits(promptLogits, genConfig);
+        const sampledToken: SampledGenerationStep = {
+          source: "prefill",
+          tokenId,
+          globalTokenPos: promptTokenIds.length,
+        };
+        const committedToken = this.commitSampledStep(sampledToken, genConfig);
+        return {
+          replayedTokens: 0,
+          sampledFromCheckpointLogits: false,
+          sampledToken,
+          committedToken,
+        };
+      }
+      for (let i = 0; i < generatedTokens.length; i++) {
+        if (i > 0) {
+          const logits = await this.forwardDecodeToken(
+            generatedTokens[i - 1].tokenId,
+          );
+          logits.dispose();
+        }
+        this.commitSampledToken(
+          generatedTokens[i].tokenId,
+          genConfig,
+          "decode",
+        );
+      }
+      return {
+        replayedTokens: generatedTokens.length,
+        sampledFromCheckpointLogits: false,
+      };
+    } finally {
+      promptLogits?.dispose();
+    }
   }
 
   /**

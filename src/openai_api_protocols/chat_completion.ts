@@ -15,7 +15,11 @@
  * limitations under the License.
  */
 
-import { MLCEngineInterface, LatencyBreakdown } from "../types";
+import {
+  MLCEngineInterface,
+  LatencyBreakdown,
+  ResumableGenerationConfig,
+} from "../types";
 import {
   functionCallingModelIds,
   MessagePlaceholders,
@@ -283,6 +287,11 @@ export interface ChatCompletionRequestBase {
      * stages of token sampling.
      */
     enable_latency_breakdown?: boolean | null;
+
+    /**
+     * Enables WebLLM crash-resumable generation for this request.
+     */
+    resumable?: ResumableGenerationConfig | null;
   };
 }
 

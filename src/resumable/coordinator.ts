@@ -845,8 +845,8 @@ export class ResumableGenerationCoordinator {
         await journal.close();
       }
     } catch (err) {
-      // Preserve an existing generation error, but report strict persistence
-      // failures from explicit iterator cancellation to its caller.
+      // Preserve an existing generation error. Otherwise, let cancellation
+      // report strict persistence failures to its caller.
       if (failure === undefined) throw err;
     }
   }

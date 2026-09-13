@@ -264,9 +264,9 @@ export function scanJournalRecords(data: ArrayBuffer): JournalScanResult {
   return { records, validBytes: offset };
 }
 
-// Separate from the session's generation lock: readers wait only for the
-// current I/O operation, not for generation to finish. The sidecar also supports
-// sync-access locking in workers without Web Locks.
+// Readers wait only for the current I/O operation. They do not acquire the
+// session's generation lock. The sidecar also supports sync-access locking
+// in workers without Web Locks.
 export function journalLockPath(path: string): string {
   return `${path}.lock`;
 }

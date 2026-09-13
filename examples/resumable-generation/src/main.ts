@@ -795,11 +795,12 @@ async function runValidationCase(
 ): Promise<ValidationCaseResult> {
   const started = performance.now();
   try {
+    const details = await fn();
     return {
       name,
       status: "pass",
       elapsedMs: performance.now() - started,
-      details: await fn(),
+      details,
     };
   } catch (err) {
     return {

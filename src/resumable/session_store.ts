@@ -1,10 +1,15 @@
-import { OPFSFileStore } from "./opfs_file_store";
+import {
+  CrossContextLockUnavailableError,
+  OPFSFileStore,
+} from "./opfs_file_store";
+import { ResumableReplayState, readResumableReplayState } from "./replay";
 import log from "loglevel";
 import {
   CheckpointCommitPayload,
   JournalRecordType,
   journalLockPath,
   readJournalRecords,
+  repairJournalTail,
 } from "./journal";
 import {
   InvalidCheckpointError,
@@ -213,6 +218,37 @@ export class ResumableSessionStore {
       }
     }
     return sessions;
+  }
+
+  /** Repair and maintain an idle session. Caller must hold its lifetime lock. */
+  async repairSession(
+    session: ResumableSessionHandle,
+  ): Promise<ResumableReplayState> {
+    await repairJournalTail(this.files, session.paths.journalPath);
+    await this.reconcileCheckpoints(session.sessionId);
+    await this.pruneCommittedCheckpoints(session.sessionId);
+    const state = await readResumableReplayState(this.files, session);
+    if (state.finished) await this.deleteKV(session.sessionId);
+    return state;
+  }
+
+  /** Active sessions are read without mutation; idle sessions are repaired first. */
+  async inspectSession(
+    session: ResumableSessionHandle,
+  ): Promise<ResumableReplayState> {
+    let release: (() => void) | undefined;
+    try {
+      release = await this.files.tryLock(session.paths.lockPath);
+    } catch (err) {
+      if (!(err instanceof CrossContextLockUnavailableError)) throw err;
+    }
+    if (release === undefined)
+      return readResumableReplayState(this.files, session);
+    try {
+      return await this.repairSession(session);
+    } finally {
+      release();
+    }
   }
 
   async deleteSession(sessionId: string): Promise<void> {

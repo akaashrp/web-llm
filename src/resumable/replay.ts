@@ -24,6 +24,13 @@ export interface ResumableReplayState {
   resumableConfig?: NormalizedResumableGenerationConfig;
   scanStoppedReason?: JournalScanResult["stoppedReason"];
   finished: boolean;
+  recordCount: number;
+  hasPromptTokens: boolean;
+  hasGenerationConfig: boolean;
+  hasResumableGenerationConfig: boolean;
+  hasUnsupportedGrammarReplay: boolean;
+  aborted: boolean;
+  engineErrorMessage?: string;
 }
 
 function isObject(value: unknown): value is Record<string, unknown> {
@@ -157,6 +164,12 @@ function summarizeReplayState(
   let sessionBeginCount = 0;
   let recoveredText = "";
   const generatedTokens: ReplayedGenerationToken[] = [];
+  let hasPromptTokens = false;
+  let hasGenerationConfig = false;
+  let hasResumableGenerationConfig = false;
+  let unsupportedGrammarReplay = false;
+  let aborted = false;
+  let engineErrorMessage: string | undefined;
 
   for (const record of scan.records) {
     switch (record.type) {
@@ -176,6 +189,7 @@ function summarizeReplayState(
         request = record.payload.request;
         break;
       case JournalRecordType.PromptTokens:
+        hasPromptTokens = true;
         promptTokenIds = [...record.payload.tokenIds];
         processedSeqLen = Math.max(processedSeqLen, promptTokenIds.length);
         break;
@@ -183,8 +197,12 @@ function summarizeReplayState(
         assistantPrefixTokenIds = [...record.payload.tokenIds];
         break;
       case JournalRecordType.GenerationConfig:
+        hasGenerationConfig = true;
         generationConfig = getGenerationConfig(record);
         resumableConfig = getResumableGenerationConfig(record);
+        hasResumableGenerationConfig ||= resumableConfig !== undefined;
+        unsupportedGrammarReplay ||=
+          hasUnsupportedGrammarReplay(generationConfig);
         break;
       case JournalRecordType.GeneratedToken:
         recoveredText = applyGeneratedTokenText(
@@ -207,6 +225,12 @@ function summarizeReplayState(
       case JournalRecordType.GenerationFinished:
         finished = true;
         break;
+      case JournalRecordType.GenerationAborted:
+        aborted = true;
+        break;
+      case JournalRecordType.EngineError:
+        engineErrorMessage = record.payload.message;
+        break;
     }
   }
 
@@ -224,6 +248,13 @@ function summarizeReplayState(
     resumableConfig,
     scanStoppedReason: scan.stoppedReason,
     finished,
+    recordCount: scan.records.length,
+    hasPromptTokens,
+    hasGenerationConfig,
+    hasResumableGenerationConfig,
+    hasUnsupportedGrammarReplay: unsupportedGrammarReplay,
+    aborted,
+    engineErrorMessage,
   };
 }
 

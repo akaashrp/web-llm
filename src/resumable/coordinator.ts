@@ -6,7 +6,15 @@ import {
   postInitAndCheckGenerationConfigValues,
 } from "../config";
 import { getConversationFromChatCompletionRequest } from "../conversation";
-import { StreamGenerationState, StreamContinuationOptions } from "../streaming";
+import {
+  StreamGenerationState,
+  StreamContinuationOptions,
+  onceAsync,
+  managedAsyncIterable,
+  lazyAsyncIterable,
+  isAsyncIterable,
+} from "../streaming";
+import { CustomLock } from "../support";
 import {
   CommittedGenerationStep,
   KVCheckpointData,
@@ -26,7 +34,11 @@ import {
   ChatCompletionChunk,
   Completion,
 } from "../openai_api_protocols";
-import { ResumeProbeResult, ResumeResult } from "../types";
+import {
+  ResumeProbeResult,
+  ResumeResult,
+  ResumeChatCompletionOptions,
+} from "../types";
 import {
   ResumableCheckpointPayload,
   ResumableCheckpointWriter,
@@ -38,14 +50,13 @@ import {
   ResumableGenerationJournal,
   normalizeResumableGenerationConfig,
 } from "./generation";
-import { repairJournalTail } from "./journal";
 import { OPFSFileStore } from "./opfs_file_store";
 import {
   ResumableReplayState,
   hasUnsupportedGrammarReplay,
   readResumableReplayState,
 } from "./replay";
-import { probeResumableSession } from "./session_probe";
+import { probeReplayState } from "./session_probe";
 import { ResumableSessionStore } from "./session_store";
 import { ResumableSessionHandle } from "./types";
 
@@ -53,18 +64,18 @@ const MIN_FREE_SPACE_BEFORE_KV_CHECKPOINT_BYTES = 512 * 1024 * 1024;
 const CHECKPOINT_RETENTION_COUNT = 2;
 const checkpointMetadataEncoder = new TextEncoder();
 
-export interface DecodeCheckpointScheduler {
+interface DecodeCheckpointScheduler {
   intervalTokens: number;
   lastCheckpointSeqLen: number;
   pageSize?: number;
 }
 
-export interface JournaledGenerationStep {
+interface JournaledGenerationStep {
   sampled: SampledGenerationStep;
   committed: CommittedGenerationStep;
 }
 
-export interface ResumeContinuationState {
+interface ResumeContinuationState {
   recoveryMode: "kv" | "token_replay";
   replayedTokens: number;
   extraEmittedTokens: number;
@@ -90,7 +101,7 @@ interface KVResumeCheckpoint {
   tailGeneratedTokens: ReplayedGenerationToken[];
 }
 
-export interface LockedResumableSession {
+interface LockedResumableSession {
   files: OPFSFileStore;
   sessions: ResumableSessionStore;
   session: ResumableSessionHandle;
@@ -99,6 +110,14 @@ export interface LockedResumableSession {
 }
 
 export interface ResumableGenerationHost {
+  getModel(modelId: string):
+    | {
+        modelId: string;
+        pipeline: LLMChatPipeline;
+        chatConfig: ChatConfig;
+        lock: CustomLock;
+      }
+    | undefined;
   resetInterrupt(): void;
   isInterrupted(): boolean;
   samplePrefill(
@@ -137,13 +156,6 @@ function isOPFSUnavailableError(err: unknown): boolean {
   return (
     err instanceof Error &&
     err.message === "OPFS is unavailable in this environment"
-  );
-}
-
-function isCrossContextLockUnavailableError(err: unknown): boolean {
-  return (
-    err instanceof Error &&
-    err.message.startsWith("Cross-context locking is unavailable")
   );
 }
 
@@ -277,14 +289,14 @@ function noteCommittedCheckpoint(
   scheduler.pageSize = checkpointPageSize(checkpoint) ?? scheduler.pageSize;
 }
 
-export function replayPromptSeqLen(state: ResumableReplayState): number {
+function replayPromptSeqLen(state: ResumableReplayState): number {
   if (state.emittedTokens === 0) {
     return state.promptTokenIds.length;
   }
   return Math.max(0, state.processedSeqLen - state.emittedTokens);
 }
 
-export function isChatCompletionReplayRequest(
+function isChatCompletionReplayRequest(
   request: unknown,
 ): request is ChatCompletionRequest {
   const messages = (request as { messages?: unknown } | undefined)?.messages;
@@ -301,7 +313,7 @@ export class ResumableGenerationCoordinator {
 
   constructor(private readonly options: ResumableCoordinatorOptions) {}
 
-  async decodeGenerationStep(
+  private async decodeGenerationStep(
     journal: ResumableGenerationJournal,
     scheduler: DecodeCheckpointScheduler,
     promptSeqLen: number,
@@ -345,7 +357,7 @@ export class ResumableGenerationCoordinator {
     pipeline.setConversation(conversation);
   }
 
-  async finishContinuation(
+  private async finishContinuation(
     state: ResumableReplayState,
     pipeline: LLMChatPipeline,
     chatConfig: ChatConfig,
@@ -396,7 +408,7 @@ export class ResumableGenerationCoordinator {
     }
   }
 
-  async *streamContinuation(
+  private async *streamContinuation(
     request: ChatCompletionRequestStreaming,
     model: string,
     pipeline: LLMChatPipeline,
@@ -480,6 +492,132 @@ export class ResumableGenerationCoordinator {
     }
   }
 
+  // Keep the journal-begin boundary explicit: errors after it belong to this
+  // generation, including failures while writing the first checkpoint/token.
+  private async prefillGeneration(
+    input: ChatCompletionRequest | CompletionCreateParams,
+    modelId: string,
+    pipeline: LLMChatPipeline,
+    chatConfig: ChatConfig,
+    genConfig: GenerationConfig,
+    journal: ResumableGenerationJournal,
+  ): Promise<SampledGenerationStep> {
+    const prefillStep = await this.options.host.samplePrefill(
+      input,
+      pipeline,
+      chatConfig,
+      genConfig,
+      {
+        capturePromptCheckpoint:
+          await this.shouldCapturePromptCheckpoint(journal),
+        storeCheckpointLogits: journal.storeCheckpointLogits,
+        reuseKVCache: false,
+      },
+    );
+    if (prefillStep.promptTokenIds === undefined) {
+      throw new Error(
+        "Resumable generation currently supports text-only prompts.",
+      );
+    }
+    await journal.begin({
+      modelId,
+      request: input,
+      promptTokenIds: prefillStep.promptTokenIds,
+      assistantPrefixTokenIds: prefillStep.assistantPrefixTokenIds ?? [],
+      generationConfig: genConfig,
+    });
+    return prefillStep;
+  }
+
+  private async commitPrefill(
+    journal: ResumableGenerationJournal,
+    pipeline: LLMChatPipeline,
+    genConfig: GenerationConfig,
+    prefillStep: SampledGenerationStep,
+  ): Promise<DecodeCheckpointScheduler> {
+    const checkpointScheduler: DecodeCheckpointScheduler = {
+      intervalTokens: journal.checkpointIntervalTokens,
+      lastCheckpointSeqLen: prefillStep.globalTokenPos,
+    };
+    await this.writePromptCheckpoint(journal, prefillStep, checkpointScheduler);
+    const committedPrefill = pipeline.commitSampledStep(prefillStep, genConfig);
+    await this.recordGeneratedToken(
+      journal,
+      pipeline,
+      prefillStep,
+      committedPrefill,
+    );
+
+    return checkpointScheduler;
+  }
+
+  async *streamGeneration(
+    request: ChatCompletionRequestStreaming | CompletionCreateParamsStreaming,
+    model: string,
+    pipeline: LLMChatPipeline,
+    chatConfig: ChatConfig,
+    genConfig: GenerationConfig,
+    timeReceived: number,
+    streamState: StreamGenerationState,
+    journal: ResumableGenerationJournal,
+  ): AsyncGenerator<ChatCompletionChunk | Completion, void, void> {
+    this.resetMetrics();
+    let journalStarted = false;
+    let journalEnded = false;
+    let failure: unknown;
+    try {
+      const prefillStep = await this.prefillGeneration(
+        request,
+        model,
+        pipeline,
+        chatConfig,
+        genConfig,
+        journal,
+      );
+      journalStarted = journal.active;
+      const scheduler = await this.commitPrefill(
+        journal,
+        pipeline,
+        genConfig,
+        prefillStep,
+      );
+      yield* this.options.host.streamCurrentGeneration(
+        request,
+        model,
+        pipeline,
+        genConfig,
+        timeReceived,
+        streamState,
+        () =>
+          this.decodeGenerationStep(
+            journal,
+            scheduler,
+            prefillStep.globalTokenPos,
+            pipeline,
+            genConfig,
+          ),
+        {
+          emitCurrent: true,
+          beforeFinalChunk: async () => {
+            await this.finishJournal(journal, pipeline.getFinishReason());
+            journalEnded = true;
+          },
+        },
+      );
+    } catch (err) {
+      failure = err;
+      if (journalStarted) await this.recordEngineError(journal, err);
+      throw err;
+    } finally {
+      await this.closeStreamJournal(
+        journal,
+        pipeline,
+        journalStarted && !journalEnded,
+        failure,
+      );
+    }
+  }
+
   async generate(
     input:
       | ChatCompletionRequestNonStreaming
@@ -498,49 +636,20 @@ export class ResumableGenerationCoordinator {
 
     let journalStarted = false;
     try {
-      const prefillStep = await this.options.host.samplePrefill(
+      const prefillStep = await this.prefillGeneration(
         input,
+        modelId,
         pipeline,
         chatConfig,
         genConfig,
-        {
-          capturePromptCheckpoint:
-            await this.shouldCapturePromptCheckpoint(journal),
-          storeCheckpointLogits: journal.storeCheckpointLogits,
-          reuseKVCache: false,
-        },
-      );
-      if (prefillStep.promptTokenIds === undefined) {
-        throw new Error(
-          "Resumable generation currently supports text-only prompts.",
-        );
-      }
-      await journal.begin({
-        modelId,
-        request: input,
-        promptTokenIds: prefillStep.promptTokenIds,
-        assistantPrefixTokenIds: prefillStep.assistantPrefixTokenIds ?? [],
-        generationConfig: genConfig,
-      });
-      journalStarted = journal.active;
-      const checkpointScheduler: DecodeCheckpointScheduler = {
-        intervalTokens: journal.checkpointIntervalTokens,
-        lastCheckpointSeqLen: prefillStep.globalTokenPos,
-      };
-      await this.writePromptCheckpoint(
         journal,
-        prefillStep,
-        checkpointScheduler,
       );
-      const committedPrefill = pipeline.commitSampledStep(
-        prefillStep,
-        genConfig,
-      );
-      await this.recordGeneratedToken(
+      journalStarted = journal.active;
+      const checkpointScheduler = await this.commitPrefill(
         journal,
         pipeline,
+        genConfig,
         prefillStep,
-        committedPrefill,
       );
 
       while (!pipeline.stopped()) {
@@ -601,7 +710,7 @@ export class ResumableGenerationCoordinator {
     return config;
   }
 
-  resetMetrics(): ResumableEngineMetrics {
+  private resetMetrics(): ResumableEngineMetrics {
     const metrics = {
       journalAppendMs: 0,
       checkpointWriteMs: 0,
@@ -613,7 +722,7 @@ export class ResumableGenerationCoordinator {
     return metrics;
   }
 
-  metrics(): ResumableEngineMetrics {
+  private metrics(): ResumableEngineMetrics {
     return this.lastMetrics ?? this.resetMetrics();
   }
 
@@ -638,7 +747,7 @@ export class ResumableGenerationCoordinator {
     }
   }
 
-  async recordGeneratedToken(
+  private async recordGeneratedToken(
     journal: ResumableGenerationJournal | undefined,
     pipeline: LLMChatPipeline,
     sampled: SampledGenerationStep,
@@ -662,7 +771,7 @@ export class ResumableGenerationCoordinator {
     }
   }
 
-  async shouldCaptureDecodeCheckpoint(
+  private async shouldCaptureDecodeCheckpoint(
     scheduler: DecodeCheckpointScheduler,
     nextProcessedSeqLen: number,
   ): Promise<boolean> {
@@ -672,13 +781,13 @@ export class ResumableGenerationCoordinator {
     );
   }
 
-  async shouldCapturePromptCheckpoint(
+  private async shouldCapturePromptCheckpoint(
     journal: ResumableGenerationJournal,
   ): Promise<boolean> {
     return journal.checkpointPrompt && (await hasKVCheckpointQuota());
   }
 
-  async writePromptCheckpoint(
+  private async writePromptCheckpoint(
     journal: ResumableGenerationJournal,
     sampled: SampledGenerationStep,
     scheduler: DecodeCheckpointScheduler,
@@ -688,7 +797,7 @@ export class ResumableGenerationCoordinator {
     }
   }
 
-  async writeDecodeCheckpoint(
+  private async writeDecodeCheckpoint(
     journal: ResumableGenerationJournal,
     scheduler: DecodeCheckpointScheduler,
     sampled: SampledGenerationStep,
@@ -698,7 +807,7 @@ export class ResumableGenerationCoordinator {
     }
   }
 
-  async finishJournal(
+  private async finishJournal(
     journal: ResumableGenerationJournal,
     finishReason: string | undefined,
   ): Promise<void> {
@@ -711,7 +820,7 @@ export class ResumableGenerationCoordinator {
     }
   }
 
-  async recordEngineError(
+  private async recordEngineError(
     journal: ResumableGenerationJournal,
     err: unknown,
   ): Promise<void> {
@@ -720,7 +829,7 @@ export class ResumableGenerationCoordinator {
     }
   }
 
-  async closeStreamJournal(
+  private async closeStreamJournal(
     journal: ResumableGenerationJournal,
     pipeline: LLMChatPipeline,
     unfinished: boolean,
@@ -742,7 +851,7 @@ export class ResumableGenerationCoordinator {
     }
   }
 
-  createResumeCheckpointScheduler(
+  private createResumeCheckpointScheduler(
     journal: ResumableGenerationJournal,
     restored: ResumeContinuationState,
   ): DecodeCheckpointScheduler {
@@ -753,7 +862,7 @@ export class ResumableGenerationCoordinator {
     };
   }
 
-  async createResumeContinuationJournal(
+  private async createResumeContinuationJournal(
     locked: LockedResumableSession,
   ): Promise<ResumableGenerationJournal> {
     const { files, sessions, session, state } = locked;
@@ -771,7 +880,7 @@ export class ResumableGenerationCoordinator {
     return journal;
   }
 
-  async recordPendingResumeToken(
+  private async recordPendingResumeToken(
     journal: ResumableGenerationJournal,
     pipeline: LLMChatPipeline,
     restored: ResumeContinuationState,
@@ -788,7 +897,154 @@ export class ResumableGenerationCoordinator {
     restored.pendingJournaledToken = undefined;
   }
 
-  async openLockedSession(sessionId: string): Promise<LockedResumableSession> {
+  async resume(
+    sessionId: string,
+    options?: ResumeChatCompletionOptions,
+  ): Promise<ResumeResult | AsyncIterable<ChatCompletionChunk>> {
+    if (options?.continueGeneration !== true) {
+      return this.readTextOnlyResult(sessionId);
+    }
+
+    if (options.stream === true) {
+      const replayState = await this.readReplayState(sessionId);
+      if (
+        this.canAttemptContinuation(replayState) &&
+        isChatCompletionReplayRequest(replayState.request) &&
+        replayState.request.stream === true
+      ) {
+        if (this.options.host.getModel(replayState.modelId) === undefined) {
+          return this.makeTextOnlyResumeResult(replayState);
+        }
+        return lazyAsyncIterable(async () => {
+          const resumed = await this.resumeEager(sessionId, options);
+          if (!isAsyncIterable<ChatCompletionChunk>(resumed)) {
+            throw new Error(
+              `Resumable session ${sessionId} became unavailable for continued streaming.`,
+            );
+          }
+          return resumed;
+        });
+      }
+    }
+
+    return this.resumeEager(sessionId, options);
+  }
+
+  private async resumeEager(
+    sessionId: string,
+    options: ResumeChatCompletionOptions | undefined,
+  ): Promise<ResumeResult | AsyncIterable<ChatCompletionChunk>> {
+    const locked = await this.openLockedSession(sessionId);
+    let releaseSessionLockOnExit = true;
+    try {
+      this.resetMetrics();
+      const replayState = locked.state;
+      if (replayState.resumableConfig === undefined) {
+        throw new Error(
+          `Resumable session ${sessionId} is missing or has malformed resumable generation config.`,
+        );
+      }
+
+      const model = this.options.host.getModel(replayState.modelId);
+      if (model === undefined)
+        return this.makeTextOnlyResumeResult(replayState);
+      const {
+        modelId: selectedModelId,
+        pipeline: selectedPipeline,
+        chatConfig: selectedChatConfig,
+        lock,
+      } = model;
+      await lock.acquire();
+      let releaseModelLockOnExit = true;
+      try {
+        if (replayState.generationConfig === undefined) {
+          return this.makeTextOnlyResumeResult(replayState);
+        }
+        const genConfig = replayState.generationConfig;
+        postInitAndCheckGenerationConfigValues(genConfig);
+        let restored = await this.tryRestoreKVResumeState(
+          locked,
+          selectedPipeline,
+          genConfig,
+        );
+        if (restored === undefined) {
+          restored = await this.restoreByTokenReplay(
+            replayState,
+            selectedPipeline,
+            genConfig,
+          );
+        }
+        if (restored === undefined) {
+          return this.makeTextOnlyResumeResult(replayState);
+        }
+
+        const resumeJournal =
+          await this.createResumeContinuationJournal(locked);
+        const checkpointScheduler = this.createResumeCheckpointScheduler(
+          resumeJournal,
+          restored,
+        );
+        const promptSeqLen = replayPromptSeqLen(replayState);
+
+        if (
+          options?.stream === true &&
+          isChatCompletionReplayRequest(replayState.request) &&
+          replayState.request.stream === true
+        ) {
+          releaseModelLockOnExit = false;
+          releaseSessionLockOnExit = false;
+          const cleanup = onceAsync(async () => {
+            try {
+              await resumeJournal.close();
+            } finally {
+              try {
+                await lock.release();
+              } finally {
+                locked.release();
+              }
+            }
+          });
+          const source = this.streamContinuation(
+            replayState.request,
+            selectedModelId,
+            selectedPipeline,
+            selectedChatConfig,
+            genConfig,
+            replayState,
+            restored,
+            resumeJournal,
+            checkpointScheduler,
+            promptSeqLen,
+            cleanup,
+          );
+          return managedAsyncIterable(source, cleanup);
+        }
+
+        return await this.finishContinuation(
+          replayState,
+          selectedPipeline,
+          selectedChatConfig,
+          genConfig,
+          restored,
+          resumeJournal,
+          checkpointScheduler,
+          promptSeqLen,
+        );
+      } finally {
+        if (releaseModelLockOnExit) {
+          await lock.release();
+        }
+      }
+    } finally {
+      if (releaseSessionLockOnExit) {
+        locked.release();
+      }
+    }
+  }
+
+  private async openLockedSession(
+    sessionId: string,
+  ): Promise<LockedResumableSession> {
     const files = this.options.getFileStore();
     const sessions = this.options.getSessionStore();
     const session = await sessions.openSession(sessionId);
@@ -800,16 +1056,7 @@ export class ResumableGenerationCoordinator {
       throw new Error(`Resumable session is already active: ${sessionId}`);
     }
     try {
-      await repairJournalTail(files, session.paths.journalPath);
-      await sessions.reconcileCheckpoints(sessionId);
-      await sessions.pruneCommittedCheckpoints(
-        sessionId,
-        CHECKPOINT_RETENTION_COUNT,
-      );
-      const state = await readResumableReplayState(files, session);
-      if (state.finished) {
-        await sessions.deleteKV(sessionId);
-      }
+      const state = await sessions.repairSession(session);
       return { files, sessions, session, state, release };
     } catch (err) {
       release();
@@ -817,7 +1064,9 @@ export class ResumableGenerationCoordinator {
     }
   }
 
-  async readReplayState(sessionId: string): Promise<ResumableReplayState> {
+  private async readReplayState(
+    sessionId: string,
+  ): Promise<ResumableReplayState> {
     const files = this.options.getFileStore();
     const session = await this.options.getSessionStore().openSession(sessionId);
     if (session === undefined) {
@@ -826,7 +1075,7 @@ export class ResumableGenerationCoordinator {
     return readResumableReplayState(files, session);
   }
 
-  canAttemptContinuation(state: ResumableReplayState): boolean {
+  private canAttemptContinuation(state: ResumableReplayState): boolean {
     return (
       state.resumableConfig !== undefined &&
       // The read-only stream probe sees an un-repaired tail. Actual recovery
@@ -838,41 +1087,15 @@ export class ResumableGenerationCoordinator {
     );
   }
 
-  async readTextOnlyResult(sessionId: string): Promise<ResumeResult> {
-    const files = this.options.getFileStore();
+  private async readTextOnlyResult(sessionId: string): Promise<ResumeResult> {
     const sessions = this.options.getSessionStore();
     const session = await sessions.openSession(sessionId);
     if (session === undefined) {
       throw new Error(`Resumable session not found: ${sessionId}`);
     }
-    let release: (() => void) | undefined;
-    try {
-      release = await files.tryLock(session.paths.lockPath);
-    } catch (err) {
-      if (!isCrossContextLockUnavailableError(err)) {
-        throw err;
-      }
-    }
-    if (release === undefined) {
-      return this.makeTextOnlyResumeResult(
-        await readResumableReplayState(files, session),
-      );
-    }
-    try {
-      await repairJournalTail(files, session.paths.journalPath);
-      await sessions.reconcileCheckpoints(sessionId);
-      await sessions.pruneCommittedCheckpoints(
-        sessionId,
-        CHECKPOINT_RETENTION_COUNT,
-      );
-      const state = await readResumableReplayState(files, session);
-      if (state.finished) {
-        await sessions.deleteKV(sessionId);
-      }
-      return this.makeTextOnlyResumeResult(state);
-    } finally {
-      release();
-    }
+    return this.makeTextOnlyResumeResult(
+      await sessions.inspectSession(session),
+    );
   }
 
   async listSessions(): Promise<ResumeProbeResult[]> {
@@ -901,48 +1124,13 @@ export class ResumableGenerationCoordinator {
     const results: ResumeProbeResult[] = [];
     for (const session of handles) {
       try {
-        let release: (() => void) | undefined;
-        try {
-          release = await files.tryLock(session.paths.lockPath);
-        } catch (err) {
-          if (!isCrossContextLockUnavailableError(err)) {
-            throw err;
-          }
-        }
-        if (release !== undefined) {
-          try {
-            await repairJournalTail(files, session.paths.journalPath);
-            await sessions.reconcileCheckpoints(session.sessionId);
-            await sessions.pruneCommittedCheckpoints(
-              session.sessionId,
-              CHECKPOINT_RETENTION_COUNT,
-            );
-          } finally {
-            release();
-          }
-        }
-        let result = await probeResumableSession(files, session);
-        if (result.reason === "generation finished") {
-          let cleanupRelease: (() => void) | undefined;
-          try {
-            cleanupRelease = await files.tryLock(session.paths.lockPath);
-          } catch (err) {
-            if (!isCrossContextLockUnavailableError(err)) {
-              throw err;
-            }
-          }
-          if (cleanupRelease !== undefined) {
-            try {
-              await sessions.deleteKV(session.sessionId);
-            } finally {
-              cleanupRelease();
-            }
-          }
-        }
+        const state = await sessions.inspectSession(session);
+        let result = probeReplayState(state);
         if (
           result.resumable &&
           result.recoveryMode === "token_replay" &&
-          (await this.hasValidKVCheckpoint(session))
+          (await this.readBestKVCheckpoint(files, sessions, session, state)) !==
+            undefined
         ) {
           result = { ...result, recoveryMode: "kv" };
         }
@@ -985,7 +1173,7 @@ export class ResumableGenerationCoordinator {
     }
   }
 
-  async tryRestoreKVResumeState(
+  private async tryRestoreKVResumeState(
     locked: LockedResumableSession,
     pipeline: LLMChatPipeline,
     genConfig: GenerationConfig,
@@ -1073,7 +1261,7 @@ export class ResumableGenerationCoordinator {
     }
   }
 
-  async restoreByTokenReplay(
+  private async restoreByTokenReplay(
     state: ResumableReplayState,
     pipeline: LLMChatPipeline,
     genConfig: GenerationConfig,
@@ -1132,7 +1320,7 @@ export class ResumableGenerationCoordinator {
     };
   }
 
-  makeTextOnlyResumeResult(state: ResumableReplayState): ResumeResult {
+  private makeTextOnlyResumeResult(state: ResumableReplayState): ResumeResult {
     return {
       sessionId: state.sessionId,
       recoveredText: state.recoveredText,
@@ -1292,18 +1480,6 @@ export class ResumableGenerationCoordinator {
         (token) => token.globalTokenPos >= best!.processedSeqLen,
       ),
     };
-  }
-
-  private async hasValidKVCheckpoint(
-    session: ResumableSessionHandle,
-  ): Promise<boolean> {
-    const files = this.options.getFileStore();
-    const sessions = this.options.getSessionStore();
-    const state = await readResumableReplayState(files, session);
-    return (
-      (await this.readBestKVCheckpoint(files, sessions, session, state)) !==
-      undefined
-    );
   }
 
   private getTokenReplayBlockReason(

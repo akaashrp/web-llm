@@ -105,6 +105,102 @@ afterEach(() => {
 });
 
 describe("MLCEngine resumable integration", () => {
+  test.each([false, true])(
+    "shared startup journals prompt/checkpoint/token in order (stream=%s)",
+    async (stream) => {
+      const { engine, pipeline } = createEngineWithPipeline(2);
+      pipeline.enablePromptCheckpoint = true;
+      const files = new MemoryFileStore();
+      attachResumableStore(engine, files);
+      const result = await engine.chatCompletion({
+        model: MODEL_ID,
+        messages: [{ role: "user", content: "Shared startup" }],
+        stream,
+        seed: 17,
+        extra_body: {
+          resumable: {
+            enabled: true,
+            sessionId: "shared-start",
+            strictPersistence: true,
+          },
+        },
+      });
+      if (Symbol.asyncIterator in result)
+        for await (const chunk of result) expect(chunk.model).toBe(MODEL_ID);
+      const { records } = await readSessionJournal(files, "shared-start");
+      const kinds = records.map((record) => record.type);
+      expect(kinds.indexOf(JournalRecordType.PromptTokens)).toBeLessThan(
+        kinds.indexOf(JournalRecordType.CheckpointCommit),
+      );
+      expect(kinds.indexOf(JournalRecordType.CheckpointCommit)).toBeLessThan(
+        kinds.indexOf(JournalRecordType.GeneratedToken),
+      );
+      expect(
+        kinds.filter((kind) => kind === JournalRecordType.SessionBegin),
+      ).toHaveLength(1);
+      expect(
+        kinds.filter((kind) => kind === JournalRecordType.GenerationFinished),
+      ).toHaveLength(1);
+      expect(pipeline.prefillCallCount).toBe(1);
+      await expect(
+        engine.chatCompletion({
+          model: MODEL_ID,
+          messages: [{ role: "user", content: "Next request" }],
+        }),
+      ).resolves.toBeDefined();
+    },
+  );
+
+  test.each([false, true])(
+    "first checkpoint failure releases session/model ownership (stream=%s)",
+    async (stream) => {
+      const { engine, pipeline } = createEngineWithPipeline(2);
+      pipeline.enablePromptCheckpoint = true;
+      const files = new MemoryFileStore();
+      attachResumableStore(engine, files);
+      const write = files.write.bind(files);
+      jest.spyOn(files, "write").mockImplementation(async (path, data) => {
+        if (path.includes("/kv/")) throw new Error("checkpoint write failed");
+        await write(path, data);
+      });
+      const generate = async () => {
+        const result = await engine.chatCompletion({
+          model: MODEL_ID,
+          messages: [{ role: "user", content: "Fail checkpoint" }],
+          stream,
+          extra_body: {
+            resumable: {
+              enabled: true,
+              sessionId: "failed-start",
+              strictPersistence: true,
+            },
+          },
+        });
+        if (Symbol.asyncIterator in result)
+          for await (const chunk of result) expect(chunk.model).toBe(MODEL_ID);
+      };
+      await expect(generate()).rejects.toThrow("checkpoint write failed");
+      const { records } = await readSessionJournal(files, "failed-start");
+      expect(
+        records.some((record) => record.type === JournalRecordType.EngineError),
+      ).toBe(true);
+      expect(
+        records.some(
+          (record) => record.type === JournalRecordType.GeneratedToken,
+        ),
+      ).toBe(false);
+      await expect(
+        engine.deleteResumableSession("failed-start"),
+      ).resolves.toBeUndefined();
+      await expect(
+        engine.chatCompletion({
+          model: MODEL_ID,
+          messages: [{ role: "user", content: "After failure" }],
+        }),
+      ).resolves.toBeDefined();
+    },
+  );
+
   test("completion rejects resumable extra_body without creating a session", async () => {
     const { engine } = createEngineWithPipeline(1);
     const files = new MemoryFileStore();

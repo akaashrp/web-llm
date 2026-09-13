@@ -19,7 +19,10 @@ import {
   readResumableReplayState,
 } from "../src/resumable/replay";
 import { ResumableSessionStore } from "../src/resumable/session_store";
-import { probeResumableSession } from "../src/resumable/session_probe";
+import {
+  probeReplayState,
+  probeResumableSession,
+} from "../src/resumable/session_probe";
 import { test, expect, jest } from "@jest/globals";
 import { MemoryFileStore, bytes } from "./helpers/memory_file_store";
 
@@ -473,4 +476,76 @@ test("replay rejects journals containing multiple session beginnings", async () 
   await expect(readResumableReplayState(store, session)).rejects.toThrow(
     "Resumable session session-a contains multiple session-begin records.",
   );
+  await expect(probeResumableSession(store, session)).rejects.toThrow(
+    "Resumable session session-a contains multiple session-begin records.",
+  );
 });
+
+test.each([
+  ["empty", false, "none", "missing journal records"],
+  ["prompt", true, "token_replay", "generation incomplete"],
+  ["token", true, "token_replay", "generation incomplete"],
+  ["abort", true, "token_replay", "generation aborted"],
+  ["error", true, "token_replay", "engine error: decode failed"],
+  ["finished", false, "none", "generation finished"],
+  [
+    "missing-rng",
+    false,
+    "text_only",
+    "missing RNG state; token replay unavailable",
+  ],
+] as const)(
+  "probe and replay share the %s journal snapshot",
+  async (stage, resumable, recoveryMode, reason) => {
+    const files = new MemoryFileStore();
+    const sessions = new ResumableSessionStore(files);
+    const config = normalizeResumableGenerationConfig({
+      enabled: true,
+      sessionId: "snapshot",
+    })!;
+    if (stage === "empty") {
+      await sessions.createSession(config.sessionId);
+    } else {
+      const journal = new ResumableGenerationJournal(files, sessions, config);
+      await journal.begin({
+        modelId: "model",
+        request: {},
+        promptTokenIds: [1, 2],
+        assistantPrefixTokenIds: [],
+        generationConfig: {},
+      });
+      if (stage !== "prompt") {
+        await journal.recordGeneratedToken({
+          globalTokenPos: 2,
+          tokenId: 3,
+          textDelta: "hi",
+          textPrefixLength: 0,
+          rngState: stage === "missing-rng" ? undefined : 42,
+        });
+      }
+      if (stage === "abort" || stage === "finished")
+        await journal.recordGenerationEnd({
+          finishReason: stage === "abort" ? "abort" : "stop",
+          emittedTokens: 1,
+        });
+      if (stage === "error")
+        await journal.recordEngineError({ err: new Error("decode failed") });
+      await journal.close();
+    }
+    const session = (await sessions.openSession(config.sessionId))!;
+    const state = await readResumableReplayState(files, session);
+    expect(await probeResumableSession(files, session)).toEqual(
+      probeReplayState(state),
+    );
+    expect(probeReplayState(state)).toMatchObject({
+      resumable,
+      recoveryMode,
+      reason,
+      emittedTokens: state.generatedTokens.length,
+      processedSeqLen: state.processedSeqLen,
+    });
+    expect(state.recoveredText).toBe(
+      stage === "empty" || stage === "prompt" ? "" : "hi",
+    );
+  },
+);

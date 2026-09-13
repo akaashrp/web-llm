@@ -1080,7 +1080,7 @@ export class ResumableGenerationCoordinator {
       state.resumableConfig !== undefined &&
       // The read-only stream probe sees an un-repaired tail. Actual recovery
       // truncates it under the session lock, acquired only on first next().
-      this.getTokenReplayBlockReason({
+      this.getContinuationBlockReason({
         ...state,
         scanStoppedReason: undefined,
       }) === undefined
@@ -1179,19 +1179,7 @@ export class ResumableGenerationCoordinator {
     genConfig: GenerationConfig,
   ): Promise<ResumeContinuationState | undefined> {
     const { files, sessions, session, state } = locked;
-    if (
-      state.finished ||
-      state.promptTokenIds.length === 0 ||
-      state.generationConfig === undefined ||
-      hasUnsupportedGrammarReplay(state.generationConfig) ||
-      this.options.hasCustomLogitProcessor(state.modelId)
-    ) {
-      return undefined;
-    }
-    if (
-      state.generatedTokens.length > 0 &&
-      state.generatedTokens.at(-1)?.rngState === undefined
-    ) {
+    if (this.getContinuationBlockReason(state) !== undefined) {
       return undefined;
     }
 
@@ -1266,7 +1254,7 @@ export class ResumableGenerationCoordinator {
     pipeline: LLMChatPipeline,
     genConfig: GenerationConfig,
   ): Promise<ResumeContinuationState | undefined> {
-    const blockReason = this.getTokenReplayBlockReason(state);
+    const blockReason = this.getContinuationBlockReason(state);
     if (blockReason !== undefined) {
       log.warn(
         `Resumable session ${state.sessionId} recovered as text-only: ${blockReason}.`,
@@ -1372,8 +1360,8 @@ export class ResumableGenerationCoordinator {
       } finally {
         this.metrics().checkpointWriteMs += performance.now() - start;
       }
-      await sessions.reconcileCheckpoints(journal.sessionId);
       if (!journal.active) {
+        await sessions.reconcileCheckpoints(journal.sessionId);
         return false;
       }
       await sessions.pruneCommittedCheckpoints(
@@ -1482,7 +1470,7 @@ export class ResumableGenerationCoordinator {
     };
   }
 
-  private getTokenReplayBlockReason(
+  private getContinuationBlockReason(
     state: ResumableReplayState,
   ): string | undefined {
     if (state.finished) {

@@ -105,6 +105,59 @@ afterEach(() => {
 });
 
 describe("MLCEngine resumable integration", () => {
+  test.each([
+    [false, "missing-rng"],
+    [true, "missing-rng"],
+    [false, "custom-processor"],
+    [true, "custom-processor"],
+  ] as const)(
+    "recovery eligibility agrees with KV=%s for %s",
+    async (kv, blocker) => {
+      const { engine, pipeline } = createEngineWithPipeline(3);
+      pipeline.enablePromptCheckpoint = kv;
+      if (blocker === "missing-rng")
+        jest.spyOn(pipeline, "getRNGState").mockReturnValue(undefined);
+      const files = new MemoryFileStore();
+      attachResumableStore(engine, files);
+      const stream = await engine.chatCompletion({
+        model: MODEL_ID,
+        messages: [{ role: "user", content: "Interrupted" }],
+        stream: true,
+        extra_body: { resumable: { enabled: true, sessionId: "eligibility" } },
+      });
+      const iterator = stream[Symbol.asyncIterator]();
+      await iterator.next();
+      await iterator.return!();
+      if (blocker === "custom-processor")
+        engine.setLogitProcessorRegistry(
+          new Map([
+            [
+              MODEL_ID,
+              {
+                processLogits: (logits: Float32Array) => logits,
+                processSampledToken: () => undefined,
+                resetState: () => undefined,
+              },
+            ],
+          ]),
+        );
+      const restoreKV = jest.spyOn(pipeline, "replayFromPromptCheckpoint");
+      const replayTokens = jest.spyOn(pipeline, "replayGenerationTokens");
+      const recoveredText = await engine.getMessage(MODEL_ID);
+      await expect(
+        engine.resumeChatCompletion("eligibility", {
+          continueGeneration: true,
+        }),
+      ).resolves.toMatchObject({
+        recoveryMode: "text_only",
+        recoveredText,
+        replayedTokens: 0,
+      });
+      expect(restoreKV).not.toHaveBeenCalled();
+      expect(replayTokens).not.toHaveBeenCalled();
+    },
+  );
+
   test.each([false, true])(
     "shared startup journals prompt/checkpoint/token in order (stream=%s)",
     async (stream) => {

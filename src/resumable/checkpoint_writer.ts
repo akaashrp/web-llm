@@ -1,3 +1,4 @@
+import { crc32c } from "./crc32c";
 import { triggerResumableFault } from "./fault_injection";
 import { OPFSFileStore } from "./opfs_file_store";
 import type { ResumableSessionStore } from "./session_store";
@@ -59,32 +60,14 @@ export class InvalidCheckpointError extends Error {}
 const META_FILE = "meta.json";
 const NEXT_LOGITS_FILE = "next_logits.f16";
 const COMPLETE_FILE = "complete";
-const CRC32C_POLY = 0x82f63b78;
 const textEncoder = new TextEncoder();
 const textDecoder = new TextDecoder();
-
-const crc32cTable = new Uint32Array(256);
-for (let i = 0; i < crc32cTable.length; i++) {
-  let crc = i;
-  for (let bit = 0; bit < 8; bit++) {
-    crc = (crc & 1) === 1 ? (crc >>> 1) ^ CRC32C_POLY : crc >>> 1;
-  }
-  crc32cTable[i] = crc >>> 0;
-}
 
 function bytes(data: CheckpointByteSource): Uint8Array<ArrayBuffer> {
   const view = ArrayBuffer.isView(data)
     ? new Uint8Array(data.buffer, data.byteOffset, data.byteLength)
     : new Uint8Array(data);
   return new Uint8Array(view);
-}
-
-function crc32c(data: Uint8Array): number {
-  let crc = 0xffffffff;
-  for (const value of data) {
-    crc = crc32cTable[(crc ^ value) & 0xff] ^ (crc >>> 8);
-  }
-  return (crc ^ 0xffffffff) >>> 0;
 }
 
 function crc32cHex(data: Uint8Array): string {

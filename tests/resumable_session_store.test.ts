@@ -143,7 +143,7 @@ test("startup cleanup removes incomplete and complete-uncommitted checkpoints", 
   expect(await files.list("resume-root/sessions/session-b/kv")).toEqual([]);
 });
 
-test("checkpoint pruning retains only the newest two committed directories", async () => {
+test("checkpoint maintenance retains two commits and cleans orphans with one index scan", async () => {
   const { files, sessions } = makeStore();
   const session = await sessions.createSession("session-a");
   for (let index = 1; index <= 3; index++) {
@@ -167,9 +167,29 @@ test("checkpoint pruning retains only the newest two committed directories", asy
     });
   }
 
+  const incomplete = sessions.getCheckpointRef("session-a", "incomplete");
+  await files.write(`${incomplete.path}/meta.json`, encoder.encode("{}"));
+  await new ResumableCheckpointWriter(files, sessions).writeCheckpoint({
+    sessionId: "session-a",
+    checkpointId: "uncommitted",
+    processedSeqLen: 4,
+    pageGroups: [],
+  });
+  const read = jest.spyOn(files, "read");
+  const list = jest.spyOn(files, "list");
   const removed = await sessions.pruneCommittedCheckpoints("session-a", 2);
 
-  expect(removed.map((ref) => ref.checkpointId)).toEqual(["checkpoint_1"]);
+  expect(
+    read.mock.calls.filter(([path]) => path === session.paths.journalPath),
+  ).toHaveLength(1);
+  expect(
+    list.mock.calls.filter(([path]) => path === session.paths.kvDir),
+  ).toHaveLength(1);
+  expect(removed.map((ref) => ref.checkpointId)).toEqual([
+    "checkpoint_1",
+    "incomplete",
+    "uncommitted",
+  ]);
   expect(await files.list(session.paths.kvDir)).toEqual([
     "checkpoint_2",
     "checkpoint_3",
@@ -255,6 +275,7 @@ test.each(["crc", "metadata", "missing", "sequence", "io"])(
       );
     }
     if (damage === "io") {
+      await files.mkdir(`${session.paths.kvDir}/orphan`);
       const read = files.read.bind(files);
       jest.spyOn(files, "read").mockImplementation(async (path) => {
         if (path === `${newest.path}/pages.wkv`)
@@ -264,7 +285,7 @@ test.each(["crc", "metadata", "missing", "sequence", "io"])(
       await expect(
         sessions.pruneCommittedCheckpoints("session-a"),
       ).rejects.toThrow("storage unavailable");
-      expect(await files.list(session.paths.kvDir)).toHaveLength(3);
+      expect(await files.list(session.paths.kvDir)).toHaveLength(4);
     } else {
       await sessions.pruneCommittedCheckpoints("session-a");
       expect(await files.list(session.paths.kvDir)).toEqual([

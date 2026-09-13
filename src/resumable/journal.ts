@@ -1,3 +1,4 @@
+import { crc32c } from "./crc32c";
 import {
   CrossContextLockUnavailableError,
   OPFSFileStore,
@@ -12,7 +13,6 @@ const SEQ_NO_OFFSET = 6;
 const CREATED_AT_MS_OFFSET = 14;
 const PAYLOAD_LEN_OFFSET = 22;
 const PAYLOAD_CRC32C_OFFSET = 26;
-const CRC32C_POLY = 0x82f63b78;
 const textEncoder = new TextEncoder();
 const textDecoder = new TextDecoder();
 
@@ -127,28 +127,11 @@ export interface JournalScanResult {
     | "invalid_payload";
 }
 
-const crc32cTable = new Uint32Array(256);
-for (let i = 0; i < crc32cTable.length; i++) {
-  let crc = i;
-  for (let bit = 0; bit < 8; bit++) {
-    crc = (crc & 1) === 1 ? (crc >>> 1) ^ CRC32C_POLY : crc >>> 1;
-  }
-  crc32cTable[i] = crc >>> 0;
-}
-
 function bytes(data: string): Uint8Array<ArrayBuffer> {
   const encoded = textEncoder.encode(data);
   const copy = new Uint8Array(encoded.byteLength);
   copy.set(encoded);
   return copy;
-}
-
-function crc32c(data: Uint8Array): number {
-  let crc = 0xffffffff;
-  for (const value of data) {
-    crc = crc32cTable[(crc ^ value) & 0xff] ^ (crc >>> 8);
-  }
-  return (crc ^ 0xffffffff) >>> 0;
 }
 
 function payloadBytes(payload: object): Uint8Array<ArrayBuffer> {

@@ -225,7 +225,6 @@ export class ResumableSessionStore {
     session: ResumableSessionHandle,
   ): Promise<ResumableReplayState> {
     await repairJournalTail(this.files, session.paths.journalPath);
-    await this.reconcileCheckpoints(session.sessionId);
     await this.pruneCommittedCheckpoints(session.sessionId);
     const state = await readResumableReplayState(this.files, session);
     if (state.finished) await this.deleteKV(session.sessionId);
@@ -309,66 +308,7 @@ export class ResumableSessionStore {
     }
   }
 
-  async listCommittedCheckpoints(
-    sessionId: string,
-  ): Promise<ResumableCheckpointRef[]> {
-    const paths = this.getSessionPaths(sessionId);
-    const journal = await readJournalRecords(this.files, paths.journalPath);
-    const committedIds = new Set<string>();
-    for (const record of journal.records) {
-      if (record.type === JournalRecordType.CheckpointCommit) {
-        committedIds.add(record.payload.checkpointId);
-      }
-    }
-    const checkpointIds = (await this.files.list(paths.kvDir))
-      .filter(isSafeSegment)
-      .sort();
-    const refs: ResumableCheckpointRef[] = [];
-    for (const checkpointId of checkpointIds) {
-      const ref = this.getCheckpointRef(sessionId, checkpointId);
-      if (
-        committedIds.has(checkpointId) &&
-        (await this.files.read(ref.completePath)) !== undefined
-      ) {
-        refs.push(ref);
-      }
-    }
-    return refs;
-  }
-
-  /** Remove incomplete checkpoints and complete directories lacking a commit. */
-  async reconcileCheckpoints(
-    sessionId: string,
-  ): Promise<ResumableCheckpointRef[]> {
-    const paths = this.getSessionPaths(sessionId);
-    const journal = await readJournalRecords(this.files, paths.journalPath);
-    const committedIds = new Set(
-      journal.records
-        .filter((record) => record.type === JournalRecordType.CheckpointCommit)
-        .map((record) => record.payload.checkpointId),
-    );
-    const removed: ResumableCheckpointRef[] = [];
-    for (const checkpointId of (await this.files.list(paths.kvDir))
-      .filter(isSafeSegment)
-      .sort()) {
-      const ref = this.getCheckpointRef(sessionId, checkpointId);
-      const complete = (await this.files.read(ref.completePath)) !== undefined;
-      if (!complete || !committedIds.has(checkpointId)) {
-        await this.files.remove(ref.path, { recursive: true });
-        removed.push(ref);
-      }
-    }
-    return removed;
-  }
-
-  /** Under the session lock, retain the newest payload-valid committed checkpoints. */
-  async pruneCommittedCheckpoints(
-    sessionId: string,
-    retain = 2,
-  ): Promise<ResumableCheckpointRef[]> {
-    if (!Number.isInteger(retain) || retain < 0) {
-      throw new Error("Checkpoint retention count must be non-negative.");
-    }
+  private async readCheckpointIndex(sessionId: string) {
     const paths = this.getSessionPaths(sessionId);
     const journal = await readJournalRecords(this.files, paths.journalPath);
     const commits = new Map<string, CheckpointCommitPayload>();
@@ -381,6 +321,55 @@ export class ResumableSessionStore {
     const checkpointIds = (await this.files.list(paths.kvDir))
       .filter(isSafeSegment)
       .sort();
+    return { commits, checkpointIds };
+  }
+
+  async listCommittedCheckpoints(
+    sessionId: string,
+  ): Promise<ResumableCheckpointRef[]> {
+    const { commits, checkpointIds } =
+      await this.readCheckpointIndex(sessionId);
+    const refs: ResumableCheckpointRef[] = [];
+    for (const checkpointId of checkpointIds) {
+      const ref = this.getCheckpointRef(sessionId, checkpointId);
+      if (
+        commits.has(checkpointId) &&
+        (await this.files.read(ref.completePath)) !== undefined
+      ) {
+        refs.push(ref);
+      }
+    }
+    return refs;
+  }
+
+  /** Remove incomplete checkpoints and complete directories lacking a commit. */
+  async reconcileCheckpoints(
+    sessionId: string,
+  ): Promise<ResumableCheckpointRef[]> {
+    const { commits, checkpointIds } =
+      await this.readCheckpointIndex(sessionId);
+    const removed: ResumableCheckpointRef[] = [];
+    for (const checkpointId of checkpointIds) {
+      const ref = this.getCheckpointRef(sessionId, checkpointId);
+      const complete = (await this.files.read(ref.completePath)) !== undefined;
+      if (!complete || !commits.has(checkpointId)) {
+        await this.files.remove(ref.path, { recursive: true });
+        removed.push(ref);
+      }
+    }
+    return removed;
+  }
+
+  /** Under the session lock, retain the newest valid commits and remove all other directories. */
+  async pruneCommittedCheckpoints(
+    sessionId: string,
+    retain = 2,
+  ): Promise<ResumableCheckpointRef[]> {
+    if (!Number.isInteger(retain) || retain < 0) {
+      throw new Error("Checkpoint retention count must be non-negative.");
+    }
+    const { commits, checkpointIds } =
+      await this.readCheckpointIndex(sessionId);
     const keep = new Set<string>();
     for (const commit of [...commits.values()].reverse()) {
       if (keep.size === retain) break;
